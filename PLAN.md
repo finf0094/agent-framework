@@ -13,6 +13,8 @@
 - [5.5. Phase 3.5: Core streaming mode](#55-phase-35-core-streaming-mode)
 - [6. Phase 4: @agent/cli](#6-phase-4-agentcli)
 - [7. Phase 5: apps/cli-app — CLI приложение (React + Ink)](#7-phase-5-appscli-app--cli-приложение-react--ink)
+- [7.5. Phase 5.5: CLI tools MVP](#75-phase-55-cli-tools-mvp)
+- [7.6. Phase 5.6: Advanced CLI UX + Sessions](#76-phase-56-advanced-cli-ux--sessions)
 - [8. Phase 6: @agent/browser](#8-phase-6-agentbrowser)
 - [9. Phase 7: @agent/rest](#9-phase-7-agentrest)
 - [10. Phase 8: Примеры (apps)](#10-phase-8-примеры-apps)
@@ -1921,11 +1923,14 @@ nx g @nx/js:library cli \
     "access": "public"
   },
   "dependencies": {
-    "@agent/core": "workspace:*"
+    "@agent/core": "workspace:*",
+    "@vscode/ripgrep": "^1.15.0"
   },
   "sideEffects": false
 }
 ```
+
+> `@vscode/ripgrep` скачивает platform-specific binary на `npm install` через `postinstall` скрипт — **без runtime-download**. Если install-скрипты отключены или binary недоступен, `search_files` падает обратно на Node.js fallback.
 
 ### 6.3. `packages/cli/tsconfig.lib.json`
 
@@ -1984,33 +1989,110 @@ nx g @nx/js:library cli \
 **`packages/cli/src/context.ts`**
 
 ```typescript
+import * as childProcess from 'node:child_process'
+import { promisify } from 'node:util'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
 import type { AgentContext } from '@agent/core'
-import { exec } from 'child_process'
-import { promisify } from 'util'
-import * as fs from 'fs/promises'
-import * as path from 'path'
 
-const execAsync = promisify(exec)
+const execAsync = promisify(childProcess.exec)
 
-export interface CliContext extends AgentContext {
-  shell: {
-    exec(command: string): Promise<{ stdout: string; stderr: string }>
-    cwd: string
-  }
-  fs: {
-    read(filePath: string): Promise<string>
-    write(filePath: string, content: string): Promise<void>
-    list(dirPath: string): Promise<string[]>
-  }
+// Patch existing context.ts — do NOT rewrite the file.
+// Keep the node: import style shown above. If the file already has older imports without node:,
+// update them to node: while patching.
+// Add these two interfaces and extend CliShell with spawn():
+
+export interface CliShellExecOptions {
+  timeoutMs?: number   // kills the child process on expiry (SIGTERM via child_process.exec timeout)
 }
+
+export interface CliShellSpawnOptions {
+  timeoutMs?: number      // kills the process on expiry — spawn throws
+  maxBufferBytes?: number // kill + throw if stdout+stderr exceeds this (default: 10 MB)
+  cwd?: string            // override working directory (default: context.shell.cwd)
+}
+
+export interface CliShellSpawnResult {
+  stdout: string
+  stderr: string
+  exitCode: number     // never throws on non-zero exit; throws only on ENOENT, timeout, or buffer overflow
+}
+
+// Extend the existing CliContext interface — shell block gets exec + spawn:
+//
+// shell: {
+//   cwd: string
+//   exec(command: string, options?: CliShellExecOptions): Promise<{ stdout: string; stderr: string; exitCode: number }>
+//   spawn(command: string, args: string[], options?: CliShellSpawnOptions): Promise<CliShellSpawnResult>
+// }
+//
+// In createCliContext, update shell — add exec update + new spawn method:
+//
+//   async exec(command, execOpts) {
+//     try {
+//       const result = await execAsync(command, {
+//         cwd, timeout: execOpts?.timeoutMs, maxBuffer: 10 * 1024 * 1024,
+//       })
+//       return { stdout: String(result.stdout), stderr: String(result.stderr), exitCode: 0 }
+//     } catch (err: any) {
+//       if (err.killed || err.signal === 'SIGTERM') throw new Error('Command timed out')
+//       return { stdout: String(err.stdout ?? ''), stderr: String(err.stderr ?? ''), exitCode: err.code ?? 1 }
+//     }
+//   },
+//
+//   async spawn(command, args, spawnOpts) {
+//     const maxBytes = spawnOpts?.maxBufferBytes ?? 10 * 1024 * 1024
+//     return new Promise((resolve, reject) => {
+//       const child = childProcess.spawn(command, args, {
+//         cwd: spawnOpts?.cwd ?? cwd,
+//         stdio: ['ignore', 'pipe', 'pipe'],
+//       })
+//       let stdout = '', stderr = '', done = false
+//       const finish = (result: CliShellSpawnResult | Error) => {
+//         if (done) return   // guard against double-resolve after timeout
+//         done = true
+//         clearTimeout(timer)
+//         result instanceof Error ? reject(result) : resolve(result)
+//       }
+//       child.stdout.on('data', (d: Buffer) => {
+//         stdout += d.toString()
+//         if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxBytes) {
+//           child.kill('SIGTERM')
+//           finish(new Error('Process output exceeded maxBufferBytes'))
+//         }
+//       })
+//       child.stderr.on('data', (d: Buffer) => {
+//         stderr += d.toString()
+//         if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) > maxBytes) {
+//           child.kill('SIGTERM')
+//           finish(new Error('Process output exceeded maxBufferBytes'))
+//         }
+//       })
+//       let timer: ReturnType<typeof setTimeout> | undefined
+//       if (spawnOpts?.timeoutMs) {
+//         timer = setTimeout(() => {
+//           child.kill('SIGTERM')
+//           finish(new Error('Command timed out'))
+//         }, spawnOpts.timeoutMs)
+//       }
+//       child.on('error', (err) => finish(err))   // ENOENT → reject
+//       child.on('close', (code) => finish({ stdout, stderr, exitCode: code ?? 1 }))
+//     })
+//   },
+//
+// Add at top of context.ts (keep existing node: imports):
+//   import * as childProcess from 'node:child_process'
+//
+// Keep existing path.resolve(cwd) and fs.write mkdir({recursive: true}) unchanged.
 
 export function createCliContext(options: { cwd?: string } = {}): CliContext {
   const cwd = options.cwd ?? process.cwd()
   return {
     shell: {
       cwd,
-      async exec(command) {
-        return execAsync(command, { cwd })
+      async exec(command, execOpts) {
+        // timeout causes child_process.exec to send SIGTERM — process is actually killed
+        return execAsync(command, { cwd, timeout: execOpts?.timeoutMs })
       },
     },
     fs: {
@@ -2608,6 +2690,2077 @@ npm install -g @agent/cli-app
 agent --model gpt-4o --stream
 agent --model gpt-4o-mini
 ```
+
+---
+
+## 7.5. Phase 5.5: CLI tools MVP
+
+**Цель:** дать cli-app минимальный безопасный набор инструментов — без него агент не может ничего делать с файлами и оболочкой.
+
+> **Не делать в этой фазе:** apply_patch, git-автоматизация, project-wide indexing, планировщик, multi-agent.
+
+### 5.5.1. Структура новых файлов в `@agent/cli`
+
+```
+packages/cli/src/
+├── tools/
+│   ├── fs-read.ts
+│   ├── fs-write.ts
+│   ├── fs-list.ts
+│   ├── search-files.ts   ← search_files (rg backend + Node fallback)
+│   ├── rg-resolver.ts    ← resolveRipgrepCommand() — internal, not exported
+│   ├── shell-exec.ts
+│   └── index.ts          ← createCliTools()
+├── system-prompt.ts      ← getDefaultCliSystemPrompt()
+```
+
+> **Расположение `rg-resolver.ts`**: находится рядом с `search-files.ts` в `tools/` — это внутренняя деталь `search_files`, не утилита общего назначения. Если захочется чище, будущий вариант рефакторинга: `tools/search-files/index.ts`, `tools/search-files/rg-resolver.ts`, `tools/search-files/node-search.ts`.
+
+### 5.5.2. Общие константы и утилиты
+
+**`packages/cli/src/tools/index.ts`**
+
+```typescript
+import path from 'node:path'
+import type { ITool } from '@agent/core'
+import type { CliContext } from '../context.js'
+import { buildFsReadTool } from './fs-read.js'
+import { buildFsWriteTool } from './fs-write.js'
+import { buildFsListTool } from './fs-list.js'
+import { buildSearchFilesTool } from './search-files.js'
+import { buildShellExecTool } from './shell-exec.js'
+
+export interface CliToolsOptions {
+  allowOutsideCwd?: boolean    // разрешить пути за пределами cwd (default: false)
+  maxOutputChars?: number      // truncate tool output in JS chars (default: 8_000)
+  maxFileChars?: number        // fs_read: max chars when no offset/limit (default: 100_000)
+  maxSearchFileChars?: number  // search_files Node fallback: max chars per file (default: 512_000)
+  shellTimeoutMs?: number      // shell timeout — process is killed on expiry (default: 30_000)
+  // NOTE: no rgPath — ripgrep resolution is internal to @agent/cli
+}
+
+// Context is NOT a parameter — it arrives in tool.execute(input, context) from core.
+// Options are build-time config only.
+export function createCliTools(options: CliToolsOptions = {}): ITool<any, any, CliContext>[] {
+  const opts = {
+    allowOutsideCwd: false,
+    maxOutputChars: 8_000,
+    maxFileChars: 100_000,
+    maxSearchFileChars: 512_000,
+    shellTimeoutMs: 30_000,
+    ...options,
+  }
+  return [
+    buildFsReadTool(opts),
+    buildFsWriteTool(opts),
+    buildFsListTool(opts),
+    buildSearchFilesTool(opts),
+    buildShellExecTool(opts),
+  ]
+}
+
+// Shared path guard — uses path.relative() for cross-platform correctness
+export function resolveSafe(cwd: string, inputPath: string, allowOutside: boolean): string {
+  const root = path.resolve(cwd)
+  const target = path.resolve(root, inputPath)
+  const rel = path.relative(root, target)
+  if (!allowOutside && (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel))) {
+    throw new Error(`Path "${inputPath}" is outside the workspace (${root})`)
+  }
+  return target
+}
+
+// Truncate long output with a clear marker
+export function truncate(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  return text.slice(0, maxChars) + `\n\n[...truncated ${text.length - maxChars} chars]`
+}
+
+export type ResolvedCliToolsOptions = Required<CliToolsOptions>
+
+export { resolveSafe, truncate }
+```
+
+### 5.5.3. `packages/cli/src/tools/fs-read.ts`
+
+```typescript
+import { z } from 'zod'
+import { buildTool } from '@agent/core'
+import type { CliContext } from '../context.js'
+import { resolveSafe, truncate } from './index.js'
+import type { ResolvedCliToolsOptions } from './index.js'
+
+export function buildFsReadTool(opts: ResolvedCliToolsOptions) {
+  return buildTool<{ path: string; offset?: number; limit?: number }, string, CliContext>({
+    name: 'fs_read',
+    description:
+      'Read a file from the workspace. Returns file content as text. ' +
+      `Without offset/limit: returns up to ${opts.maxFileChars} chars (beginning of file). ` +
+      'For large files, use offset/limit (line numbers) to read any chunk regardless of file size.',
+    inputSchema: z.object({
+      path: z.string().describe('File path relative to workspace root'),
+      offset: z.number().int().min(0).optional().describe('Start line (0-based)'),
+      limit: z.number().int().min(1).optional().describe('Max lines to return'),
+    }),
+    async execute({ path: filePath, offset, limit }, context) {
+      const resolved = resolveSafe(context.shell.cwd, filePath, opts.allowOutsideCwd)
+      let content = await context.fs.read(resolved)
+      if (offset !== undefined || limit !== undefined) {
+        // offset/limit are specified — slice by lines regardless of file size
+        const lines = content.split('\n')
+        const start = offset ?? 0
+        const end = limit !== undefined ? start + limit : lines.length
+        content = lines.slice(start, end).join('\n')
+      } else if (content.length > opts.maxFileChars) {
+        // No chunking requested: cap large files.
+        // For files beyond maxFileChars, use offset/limit to read specific chunks.
+        content = content.slice(0, opts.maxFileChars) +
+          `\n\n[...file truncated at ${opts.maxFileChars} chars — use offset/limit to read further]`
+      }
+      return truncate(content, opts.maxOutputChars)
+    },
+  })
+}
+```
+
+### 5.5.4. `packages/cli/src/tools/fs-write.ts`
+
+```typescript
+import { z } from 'zod'
+import { buildTool } from '@agent/core'
+import type { CliContext } from '../context.js'
+import { resolveSafe } from './index.js'
+import type { ResolvedCliToolsOptions } from './index.js'
+
+export function buildFsWriteTool(opts: ResolvedCliToolsOptions) {
+  return buildTool<{ path: string; content: string }, string, CliContext>({
+    name: 'fs_write',
+    description: 'Write (or overwrite) a file in the workspace. Requires user approval.',
+    inputSchema: z.object({
+      path: z.string().describe('File path relative to workspace root'),
+      content: z.string().describe('Full file content to write'),
+    }),
+    needsApproval({ input }) {
+      return {
+        behavior: 'pause',
+        message: `Write ${input.content.length} chars to "${input.path}"?`,
+      }
+    },
+    async execute({ path: filePath, content }, context) {
+      const resolved = resolveSafe(context.shell.cwd, filePath, opts.allowOutsideCwd)
+      await context.fs.write(resolved, content)
+      return `Written ${content.length} chars to ${filePath}`
+    },
+  })
+}
+```
+
+### 5.5.5. `packages/cli/src/tools/fs-list.ts`
+
+```typescript
+import { z } from 'zod'
+import { buildTool } from '@agent/core'
+import type { CliContext } from '../context.js'
+import { resolveSafe } from './index.js'
+import type { ResolvedCliToolsOptions } from './index.js'
+
+export function buildFsListTool(opts: ResolvedCliToolsOptions) {
+  return buildTool<{ path?: string }, string, CliContext>({
+    name: 'fs_list',
+    description: 'List files and directories. Defaults to workspace root.',
+    inputSchema: z.object({
+      path: z.string().optional().describe('Directory path relative to workspace root'),
+    }),
+    async execute({ path: dirPath }, context) {
+      const resolved = resolveSafe(context.shell.cwd, dirPath ?? '.', opts.allowOutsideCwd)
+      const entries = await context.fs.list(resolved)
+      return entries.join('\n')
+    },
+  })
+}
+```
+
+### 5.5.6. `packages/cli/src/tools/rg-resolver.ts`
+
+Internal helper — не экспортируется из `@agent/cli`. Выбирает backend в порядке: env → bundled → system.
+
+```typescript
+import { createRequire } from 'node:module'
+
+const require = createRequire(import.meta.url)
+
+function getBundledRgPath(): string | undefined {
+  try {
+    // @vscode/ripgrep ships a platform binary via postinstall — no runtime download
+    const { rgPath } = require('@vscode/ripgrep') as { rgPath: unknown }
+    return typeof rgPath === 'string' ? rgPath : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// Resolution order:
+//   1. AGENT_RG_PATH env (user override)
+//   2. @vscode/ripgrep bundled binary
+//   3. 'rg' (system PATH — caller handles ENOENT → Node fallback)
+export function resolveRipgrepCommand(): string {
+  return process.env['AGENT_RG_PATH'] ?? getBundledRgPath() ?? 'rg'
+}
+```
+
+### 5.5.7. `packages/cli/src/tools/search-files.ts`
+
+```typescript
+import nodefs from 'node:fs/promises'
+import path from 'node:path'
+import { z } from 'zod'
+import { buildTool } from '@agent/core'
+import type { CliContext } from '../context.js'
+import { resolveSafe, truncate } from './index.js'
+import type { ResolvedCliToolsOptions } from './index.js'
+import { resolveRipgrepCommand } from './rg-resolver.js'
+
+const SKIP_DIRS = new Set(['.git', 'node_modules', 'dist', '.nx', '.next', 'coverage', '__pycache__'])
+
+const RG_ARGS_BASE = [
+  '--line-number', '--no-heading', '--color=never', '--hidden',
+  '--glob', '!.git/**', '--glob', '!node_modules/**', '--glob', '!dist/**',
+  '--glob', '!.nx/**', '--glob', '!.next/**', '--glob', '!coverage/**', '--glob', '!__pycache__/**',
+]
+
+// Node.js fallback search
+async function nodeSearch(
+  resolved: string,
+  cwd: string,
+  regex: RegExp,
+  maxMatches: number,
+  maxFileChars: number,
+): Promise<{ lines: string[]; stopped: boolean }> {
+  const lines: string[] = []
+
+  async function searchDir(dir: string): Promise<void> {
+    const entries = await nodefs.readdir(dir, { withFileTypes: true })
+    for (const entry of entries) {
+      if (lines.length >= maxMatches) return
+      if (SKIP_DIRS.has(entry.name)) continue
+      const entryPath = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        await searchDir(entryPath)
+      } else {
+        try {
+          let content = await nodefs.readFile(entryPath, 'utf-8')
+          if (content.length > maxFileChars) content = content.slice(0, maxFileChars)
+          const rel = path.relative(cwd, entryPath)
+          content.split('\n').forEach((line, i) => {
+            if (lines.length < maxMatches && regex.test(line)) {
+              lines.push(`${rel}:${i + 1}: ${line}`)
+            }
+          })
+        } catch { /* skip binary/unreadable */ }
+      }
+    }
+  }
+
+  const stat = await nodefs.stat(resolved)
+  if (stat.isFile()) {
+    let content = await nodefs.readFile(resolved, 'utf-8')
+    if (content.length > maxFileChars) content = content.slice(0, maxFileChars)
+    const rel = path.relative(cwd, resolved)
+    content.split('\n').forEach((line, i) => {
+      if (lines.length < maxMatches && regex.test(line)) lines.push(`${rel}:${i + 1}: ${line}`)
+    })
+  } else {
+    await searchDir(resolved)
+  }
+
+  return { lines, stopped: lines.length >= maxMatches }
+}
+
+export function buildSearchFilesTool(opts: ResolvedCliToolsOptions) {
+  return buildTool<
+    { pattern: string; path?: string; caseSensitive?: boolean; maxMatches?: number },
+    string,
+    CliContext
+  >({
+    name: 'search_files',
+    description:
+      'Search for a text pattern in files. Uses ripgrep when available, Node.js fallback otherwise. ' +
+      'Returns "file:line: content" lines. First line shows backend used. ' +
+      'Skips .git, node_modules, dist, coverage.',
+    inputSchema: z.object({
+      pattern: z.string().describe('Search pattern (ripgrep/JS regex syntax)'),
+      path: z.string().optional().describe('Directory or file to search (default: workspace root)'),
+      caseSensitive: z.boolean().optional().describe('Case-sensitive search (default: false)'),
+      maxMatches: z.number().int().min(1).max(1000).optional().describe('Max matches to return (default: 500)'),
+    }),
+    async execute({ pattern, path: searchPath, caseSensitive, maxMatches: maxMatchesOpt }, context) {
+      const resolved = resolveSafe(context.shell.cwd, searchPath ?? '.', opts.allowOutsideCwd)
+      const maxMatches = maxMatchesOpt ?? 500
+
+      // ── ripgrep backend ────────────────────────────────────────────────────
+      const rgCommand = resolveRipgrepCommand()
+      const rgArgs = [
+        ...RG_ARGS_BASE,
+        ...(caseSensitive ? [] : ['--ignore-case']),
+        '--', pattern, resolved,
+      ]
+
+      let usedRg = false
+      try {
+        const { stdout, exitCode } = await context.shell.spawn(rgCommand, rgArgs, {
+          timeoutMs: opts.shellTimeoutMs,
+        })
+        usedRg = true
+
+        if (exitCode === 0) {
+          const trimmed = stdout.trimEnd()
+          const allLines = trimmed ? trimmed.split('\n') : []
+          const lines = allLines.slice(0, maxMatches)
+          const stopped = allLines.length > maxMatches
+          const output = `backend: rg\n` +
+            (lines.join('\n') || '(no matches)') +
+            (stopped ? '\n[...stopped at max matches]' : '')
+          return truncate(output, opts.maxOutputChars)
+        }
+
+        if (exitCode === 1) {
+          // exitCode 1 = no matches — not an error
+          return truncate(`backend: rg\n(no matches)`, opts.maxOutputChars)
+        }
+
+        // exitCode > 1: rg error — fall through to Node fallback
+      } catch (err: any) {
+        // timeout propagates up — do not fall back
+        if (err.message?.includes('timed out') || err.message?.includes('maxBufferBytes')) throw err
+        // ENOENT or other spawn error → Node fallback
+      }
+
+      // ── Node.js fallback ───────────────────────────────────────────────────
+      let regex: RegExp
+      try {
+        regex = new RegExp(pattern, caseSensitive ? '' : 'i')
+      } catch {
+        return `backend: node\nError: invalid regex pattern "${pattern}"`
+      }
+
+      const { lines, stopped } = await nodeSearch(
+        resolved, context.shell.cwd, regex, maxMatches, opts.maxSearchFileChars,
+      )
+      const backend = usedRg ? 'node (rg fallback)' : 'node'
+      const output = `backend: ${backend}\n` +
+        (lines.length > 0 ? lines.join('\n') : '(no matches)') +
+        (stopped ? '\n[...stopped at max matches]' : '')
+      return truncate(output, opts.maxOutputChars)
+    },
+  })
+}
+```
+
+### 5.5.8. `packages/cli/src/tools/shell-exec.ts`
+
+```typescript
+import { z } from 'zod'
+import { buildTool } from '@agent/core'
+import type { CliContext } from '../context.js'
+import { truncate } from './index.js'
+import type { ResolvedCliToolsOptions } from './index.js'
+
+export function buildShellExecTool(opts: ResolvedCliToolsOptions) {
+  return buildTool<{ command: string }, string, CliContext>({
+    name: 'shell_exec',
+    description:
+      'Run a shell command in the workspace directory. ' +
+      `Output is truncated to ${opts.maxOutputChars} chars. Timeout: ${opts.shellTimeoutMs}ms (process is killed on expiry). ` +
+      'Requires user approval. Avoid destructive or irreversible commands.',
+    inputSchema: z.object({
+      command: z.string().describe('Shell command to execute'),
+    }),
+    needsApproval({ input }) {
+      return {
+        behavior: 'pause',
+        message: `Run command: ${input.command}`,
+      }
+    },
+    async execute({ command }, context) {
+      // shell.exec never throws on non-zero exit — timeout/signal errors still throw
+      const { stdout, stderr, exitCode } = await context.shell.exec(command, { timeoutMs: opts.shellTimeoutMs })
+      const parts = [
+        exitCode !== 0 ? `Exit code: ${exitCode}` : null,
+        stdout ? `STDOUT:\n${stdout}` : null,
+        stderr ? `STDERR:\n${stderr}` : null,
+      ].filter(Boolean)
+      return truncate(parts.join('\n') || '(no output)', opts.maxOutputChars)
+    },
+  })
+}
+```
+
+> `context.shell.exec`: non-zero exit code не бросает исключение — возвращает `{ stdout, stderr, exitCode }` как обычный результат. Timeout/signal бросает исключение (становится `tool.failed`). `maxBuffer: 10 MB` предотвращает OOM до `truncate()`.
+
+### 5.5.10. `packages/cli/src/system-prompt.ts`
+
+```typescript
+export function getDefaultCliSystemPrompt(cwd: string): string {
+  return `You are a local CLI coding assistant running in: ${cwd}
+
+Available tools:
+- fs_read      — read a file (supports offset/limit for large files)
+- fs_write     — write or overwrite a file (requires approval)
+- fs_list      — list directory contents
+- search_files — search text in files using regex (uses ripgrep when available, Node.js fallback otherwise)
+- shell_exec   — run a shell command (requires approval, 30s timeout)
+
+Rules:
+- Always read relevant files before making changes.
+- Prefer targeted edits; explain every change briefly.
+- Do not access paths outside the workspace unless the user explicitly allows it.
+- fs_write and shell_exec pause for user approval — never assume they will be auto-approved.
+- When output is truncated, request a narrower command or read specific files directly.
+- Avoid destructive commands (rm -rf, DROP TABLE, etc.) unless the user explicitly asks.`
+}
+```
+
+### 5.5.11. Обновление `packages/cli/src/index.ts`
+
+```typescript
+export type { CliContext, CliFs, CliShell } from './context.js'
+export { createCliContext } from './context.js'
+export { FsMemoryStore } from './memory/fs-memory.js'
+export { FsCheckpointStore } from './memory/fs-checkpoint.js'
+export type { ApprovalAdapter, ApprovalRequest, ApprovalResponse, RunWithApprovalOptions } from './agent.js'
+export { ReadlineApprovalAdapter, createCliAgent, runWithApproval } from './agent.js'
+export type { CliToolsOptions } from './tools/index.js'
+export { createCliTools } from './tools/index.js'
+export { getDefaultCliSystemPrompt } from './system-prompt.js'
+// NOTE: rg-resolver.ts is intentionally NOT exported — it is an internal implementation detail.
+// resolveRipgrepCommand() is not part of the public API.
+```
+
+### 5.5.12. Подключение в `apps/cli-app/src/app.tsx`
+
+Не переписывать `app.tsx`. Добавить патч в существующий файл:
+
+```typescript
+// Добавить в импорты:
+import { createCliTools, getDefaultCliSystemPrompt } from '@agent/cli'
+
+// В существующий new Agent({...}) добавить две строки:
+//   tools: createCliTools(),
+//   system: getDefaultCliSystemPrompt(context.shell.cwd),
+//
+// Dependency array useMemo — сохранить текущий (не перечислять здесь,
+// чтобы не расходиться с реальным app.tsx). Если context стабилен
+// (создан в useMemo([], [])), добавлять его в deps не нужно.
+```
+
+### 5.5.13. Тесты `packages/cli/test/tools.test.ts`
+
+```typescript
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
+import * as os from 'node:os'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import { createCliContext } from '../src/context.js'
+import { createCliTools } from '../src/tools/index.js'
+
+// Helper: find tool by name
+function getTool(tools: ReturnType<typeof createCliTools>, name: string) {
+  const t = tools.find((t) => t.name === name)
+  if (!t) throw new Error(`Tool ${name} not found`)
+  return t
+}
+
+describe('CLI tools', () => {
+  let tmpDir: string
+  let ctx: ReturnType<typeof createCliContext>
+  let tools: ReturnType<typeof createCliTools>
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-cli-tools-'))
+    ctx = createCliContext({ cwd: tmpDir })
+    tools = createCliTools()
+  })
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  })
+
+  // ── fs_read ──────────────────────────────────────────────────────────────
+  it('fs_read: reads a file', async () => {
+    await fs.writeFile(path.join(tmpDir, 'hello.txt'), 'Hello, world!')
+    const result = await getTool(tools, 'fs_read').execute({ path: 'hello.txt' }, ctx)
+    expect(result).toBe('Hello, world!')
+  })
+
+  it('fs_read: offset and limit slice by lines', async () => {
+    const lines = ['a', 'b', 'c', 'd', 'e']
+    await fs.writeFile(path.join(tmpDir, 'lines.txt'), lines.join('\n'))
+    const result = await getTool(tools, 'fs_read').execute({ path: 'lines.txt', offset: 1, limit: 2 }, ctx)
+    expect(result).toBe('b\nc')
+  })
+
+  it('fs_read: truncates at maxFileChars when no offset/limit', async () => {
+    const bigContent = 'x'.repeat(200_000)
+    await fs.writeFile(path.join(tmpDir, 'big.txt'), bigContent)
+    const smallTools = createCliTools({ maxFileChars: 100 })
+    const result = await getTool(smallTools, 'fs_read').execute({ path: 'big.txt' }, ctx)
+    expect(result).toContain('[...file truncated')
+  })
+
+  it('fs_read: offset/limit bypasses maxFileChars — reads any chunk of large file', async () => {
+    // Build a file where line 200 is beyond maxFileChars but reachable via offset
+    const lines = Array.from({ length: 300 }, (_, i) => `line${i}`)
+    await fs.writeFile(path.join(tmpDir, 'large.txt'), lines.join('\n'))
+    const smallTools = createCliTools({ maxFileChars: 10 })  // tiny maxFileChars
+    const result = await getTool(smallTools, 'fs_read').execute(
+      { path: 'large.txt', offset: 200, limit: 3 },
+      ctx,
+    )
+    expect(result).toContain('line200')
+    expect(result).toContain('line202')
+    expect(result).not.toContain('[...file truncated')
+  })
+
+  it('fs_read: blocks path traversal outside cwd', async () => {
+    await expect(
+      getTool(tools, 'fs_read').execute({ path: '../../etc/passwd' }, ctx),
+    ).rejects.toThrow('outside the workspace')
+  })
+
+  // ── fs_list ───────────────────────────────────────────────────────────────
+  it('fs_list: lists workspace root', async () => {
+    await fs.writeFile(path.join(tmpDir, 'a.ts'), '')
+    await fs.mkdir(path.join(tmpDir, 'sub'))
+    const result = await getTool(tools, 'fs_list').execute({}, ctx)
+    expect(result).toContain('a.ts')
+    expect(result).toContain('sub/')
+  })
+
+  it('fs_list: blocks traversal outside cwd', async () => {
+    await expect(
+      getTool(tools, 'fs_list').execute({ path: '../' }, ctx),
+    ).rejects.toThrow('outside the workspace')
+  })
+
+  // ── fs_write ──────────────────────────────────────────────────────────────
+  it('fs_write: writes a file', async () => {
+    await getTool(tools, 'fs_write').execute({ path: 'out.txt', content: 'data' }, ctx)
+    const content = await fs.readFile(path.join(tmpDir, 'out.txt'), 'utf-8')
+    expect(content).toBe('data')
+  })
+
+  it('fs_write: requires approval (needsApproval returns pause)', () => {
+    const tool = getTool(tools, 'fs_write')
+    const decision = tool.needsApproval!({ input: { path: 'x.txt', content: 'y' }, context: ctx })
+    expect(decision).toMatchObject({ behavior: 'pause' })
+  })
+
+  it('fs_write: blocks path traversal', async () => {
+    await expect(
+      getTool(tools, 'fs_write').execute({ path: '../../evil.txt', content: 'bad' }, ctx),
+    ).rejects.toThrow('outside the workspace')
+  })
+
+  // ── shell_exec ────────────────────────────────────────────────────────────
+  it('shell_exec: requires approval (needsApproval returns pause)', () => {
+    const tool = getTool(tools, 'shell_exec')
+    const decision = tool.needsApproval!({ input: { command: 'echo hi' }, context: ctx })
+    expect(decision).toMatchObject({ behavior: 'pause' })
+  })
+
+  it('shell_exec: returns stdout for zero-exit command', async () => {
+    const result = await getTool(tools, 'shell_exec').execute(
+      { command: 'node -e "process.stdout.write(\'ok\')"' },
+      ctx,
+    )
+    expect(result).toContain('ok')
+  })
+
+  it('shell_exec: non-zero exit returns output, not exception', async () => {
+    // node exits with code 1 — should return tool result with exitCode, not throw
+    const result = await getTool(tools, 'shell_exec').execute(
+      { command: 'node -e "process.stderr.write(\'err\'); process.exit(1)"' },
+      ctx,
+    )
+    expect(result).toContain('Exit code: 1')
+    expect(result).toContain('err')
+  })
+
+  it('shell_exec: truncates output exceeding maxOutputChars', async () => {
+    const smallTools = createCliTools({ maxOutputChars: 10 })
+    const result = await getTool(smallTools, 'shell_exec').execute(
+      { command: 'node -e "process.stdout.write(\'x\'.repeat(200))"' },
+      ctx,
+    )
+    expect(result).toContain('[...truncated')
+    expect(result.indexOf('[...truncated')).toBeLessThanOrEqual(15)
+  })
+
+  it('shell_exec: kills process after timeout', async () => {
+    const fastTimeout = createCliTools({ shellTimeoutMs: 100 })
+    await expect(
+      getTool(fastTimeout, 'shell_exec').execute(
+        { command: 'node -e "setTimeout(() => {}, 5000)"' },
+        ctx,
+      ),
+    ).rejects.toThrow('timed out')
+  })
+
+  // ── search_files — helpers ────────────────────────────────────────────────
+  // Most search_files tests use a fake spawn so they don't require rg installed.
+  function makeSpawnResult(stdout: string, exitCode = 0) {
+    return { stdout, stderr: '', exitCode }
+  }
+
+  function ctxWithSpawn(spawnFn: typeof ctx.shell.spawn) {
+    return { ...ctx, shell: { ...ctx.shell, spawn: spawnFn } }
+  }
+
+  // ── search_files — rg backend ─────────────────────────────────────────────
+  it('search_files: createCliTools has no rgPath option', () => {
+    const opts: import('../src/tools/index.js').CliToolsOptions = {}
+    expect('rgPath' in opts).toBe(false)
+  })
+
+  it('search_files: rg success returns backend: rg', async () => {
+    const fakeCtx = ctxWithSpawn(async () => makeSpawnResult('src/a.ts:1: const x = 42'))
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'const x' }, fakeCtx)
+    expect(result).toContain('backend: rg')
+    expect(result).toContain('src/a.ts:1')
+  })
+
+  it('search_files: empty rg stdout (exitCode 0) returns no matches, not crash', async () => {
+    const fakeCtx = ctxWithSpawn(async () => makeSpawnResult(''))
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'x' }, fakeCtx)
+    expect(result).toContain('backend: rg')
+    expect(result).toContain('(no matches)')
+  })
+
+  it('search_files: passes shellTimeoutMs into spawn options', async () => {
+    const capturedOpts: any[] = []
+    const fakeCtx = ctxWithSpawn(async (_cmd, _args, opts) => {
+      capturedOpts.push(opts)
+      return makeSpawnResult('')
+    })
+    const customTools = createCliTools({ shellTimeoutMs: 5_000 })
+    await getTool(customTools, 'search_files').execute({ pattern: 'x' }, fakeCtx)
+    expect(capturedOpts[0]?.timeoutMs).toBe(5_000)
+  })
+
+  it('search_files: spawn maxBufferBytes overflow throws, does not fall back to Node', async () => {
+    const fakeCtx = ctxWithSpawn(async () => {
+      throw new Error('Process output exceeded maxBufferBytes')
+    })
+    await expect(
+      getTool(tools, 'search_files').execute({ pattern: 'x' }, fakeCtx),
+    ).rejects.toThrow('maxBufferBytes')
+  })
+
+  it('search_files: rg exitCode 1 = no matches, not error', async () => {
+    const fakeCtx = ctxWithSpawn(async () => makeSpawnResult('', 1))
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'xyz' }, fakeCtx)
+    expect(result).toContain('backend: rg')
+    expect(result).toContain('(no matches)')
+  })
+
+  it('search_files: rg ENOENT falls back to Node backend', async () => {
+    await fs.writeFile(path.join(tmpDir, 'code.ts'), 'const x = 42')
+    const fakeCtx = ctxWithSpawn(async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) })
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'const x' }, fakeCtx)
+    expect(result).toContain('backend: node')
+    expect(result).toContain('const x')
+  })
+
+  it('search_files: rg exitCode > 1 falls back to Node backend', async () => {
+    await fs.writeFile(path.join(tmpDir, 'code.ts'), 'hello world')
+    const fakeCtx = ctxWithSpawn(async () => makeSpawnResult('', 2))
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'hello' }, fakeCtx)
+    expect(result).toContain('backend: node')
+    expect(result).toContain('hello')
+  })
+
+  it('search_files: AGENT_RG_PATH env overrides bundled rg', async () => {
+    const spawnCalls: string[] = []
+    const fakeCtx = ctxWithSpawn(async (cmd) => { spawnCalls.push(cmd); return makeSpawnResult('') })
+    process.env['AGENT_RG_PATH'] = '/custom/rg'
+    try {
+      await getTool(tools, 'search_files').execute({ pattern: 'x' }, fakeCtx)
+    } finally {
+      delete process.env['AGENT_RG_PATH']
+    }
+    expect(spawnCalls[0]).toBe('/custom/rg')
+  })
+
+  // ── search_files — Node fallback ──────────────────────────────────────────
+  it('search_files (Node): finds pattern', async () => {
+    await fs.writeFile(path.join(tmpDir, 'code.ts'), 'const x = 42\nconst y = 0')
+    const fakeCtx = ctxWithSpawn(async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) })
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'const x' }, fakeCtx)
+    expect(result).toContain('code.ts')
+    expect(result).toContain('const x')
+  })
+
+  it('search_files (Node): case-insensitive by default', async () => {
+    await fs.writeFile(path.join(tmpDir, 'readme.md'), 'Hello World')
+    const fakeCtx = ctxWithSpawn(async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) })
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'hello' }, fakeCtx)
+    expect(result).toContain('Hello World')
+  })
+
+  it('search_files (Node): skips node_modules', async () => {
+    await fs.mkdir(path.join(tmpDir, 'node_modules', 'pkg'), { recursive: true })
+    await fs.writeFile(path.join(tmpDir, 'node_modules', 'pkg', 'index.js'), 'const secret = 1')
+    const fakeCtx = ctxWithSpawn(async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) })
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'secret' }, fakeCtx)
+    expect(result).toContain('(no matches)')
+  })
+
+  it('search_files (Node): invalid regex returns clear error, not exception', async () => {
+    const fakeCtx = ctxWithSpawn(async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) })
+    const result = await getTool(tools, 'search_files').execute({ pattern: '[invalid' }, fakeCtx)
+    expect(result).toContain('invalid regex')
+    expect(result).not.toContain('throw')
+  })
+
+  it('search_files: maxMatches respected', async () => {
+    const lines = Array.from({ length: 50 }, (_, i) => `match line ${i}`).join('\n')
+    await fs.writeFile(path.join(tmpDir, 'big.ts'), lines)
+    const fakeCtx = ctxWithSpawn(async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) })
+    const result = await getTool(tools, 'search_files').execute({ pattern: 'match', maxMatches: 5 }, fakeCtx)
+    const matchLines = result.split('\n').filter(l => l.includes('match line'))
+    expect(matchLines.length).toBeLessThanOrEqual(5)
+  })
+
+  it('search_files (Node): maxSearchFileChars limits per-file reading', async () => {
+    const huge = 'x'.repeat(600_000) + '\ntarget line'
+    await fs.writeFile(path.join(tmpDir, 'huge.ts'), huge)
+    const smallTools = createCliTools({ maxSearchFileChars: 100 })
+    const fakeCtx = ctxWithSpawn(async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) })
+    const result = await getTool(smallTools, 'search_files').execute({ pattern: 'target' }, fakeCtx)
+    // 'target' is beyond maxSearchFileChars so not found
+    expect(result).toContain('(no matches)')
+  })
+})
+```
+
+### 5.5.14. Checklist Phase 5.5
+
+- [ ] `createCliTools(options?)` не имеет `rgPath` в публичных опциях, возвращает `ITool<any, any, CliContext>[]`
+- [ ] `@vscode/ripgrep` добавлен в `dependencies` `packages/cli/package.json`
+- [ ] `rg-resolver.ts` внутренний, не экспортируется из `@agent/cli` — только `import` внутри `search-files.ts`
+- [ ] `search_files`: rg backend передаёт `{ timeoutMs: opts.shellTimeoutMs }` в `spawn`
+- [ ] `search_files`: rg stdout parsing — один `split('\n')`, пустой stdout → `allLines = []`, не crash
+- [ ] `search_files`: exitCode 1 = no matches; ENOENT/exitCode>1 → Node fallback; timeout/maxBufferBytes → throw, no fallback
+- [ ] `search_files`: Node fallback — pure JS, invalid regex → clear tool result, `maxSearchFileChars` per file
+- [ ] Первая строка результата `search_files` — `backend: rg` / `backend: node` / `backend: node (rg fallback)`
+- [ ] `CliShell.spawn`: `maxBufferBytes` (default 10 MB) — убивает процесс и бросает `"Process output exceeded maxBufferBytes"`; одиночный `done` guard предотвращает double-resolve после timeout
+- [ ] `CliShell.spawn` добавлен через патч context.ts с `import * as childProcess from 'node:child_process'`; non-zero не бросает, ENOENT/timeout/maxBufferBytes бросают
+- [ ] `getDefaultCliSystemPrompt` упоминает `search_files` (не `fs_grep`), не упоминает `rgPath`
+- [ ] `resolveSafe()` использует `path.relative()` для кроссплатформенной проверки
+- [ ] `fs_read`: без offset/limit — обрезает по `maxFileChars`; с offset/limit — читает любой кусок
+- [ ] `fs_write` требует approval, блокирует traversal
+- [ ] `shell_exec`: non-zero exit → tool result с `Exit code / STDOUT / STDERR`; `maxBuffer: 10 MB`
+- [ ] Тесты `search_files` не требуют rg — используют `ctxWithSpawn` mock
+- [ ] Тесты кроссплатформенные: нет `sleep`, нет системного `grep` или `rg`
+- [ ] `context.ts` не переписан целиком — добавлен `spawn`, расширена сигнатура `exec`
+- [ ] `nx test @agent/cli` — все тесты проходят
+
+---
+
+## 7.6. Phase 5.6: Advanced CLI UX + Sessions
+
+### 5.6.1. Цель
+
+Сделать `apps/cli-app` удобным интерактивным coding-agent CLI: сессии с персистентностью, slash-команды, resume после approval, улучшенный StatusBar/ChatHistory. Scope ограничен `@agent/cli` и `apps/cli-app` — `@agent/core` не трогается.
+
+### 5.6.2. Структура новых файлов
+
+```
+packages/cli/src/
+├── session/
+│   ├── model.ts          ← CliSession type, CliSessionStatus
+│   ├── fs-session.ts     ← FsSessionStore
+│   └── helpers.ts        ← createSessionId, createThreadId, getSessionTitle
+└── index.ts              ← export FsSessionStore, CliSession, helpers
+
+apps/cli-app/src/
+├── commands/
+│   ├── registry.ts       ← CommandDef[], executeCommand()
+│   └── parser.ts         ← parseSlashCommand()
+├── hooks/
+│   └── useAgent.ts       ← updated: null-safe, AsyncGenerator, session callbacks, updateSession helper
+├── store.ts              ← EXTENDED (same Phase 5 file): add UiMessage, SessionSlice, MessagesSlice
+├── components/
+│   ├── StatusBar.tsx      ← updated: session title, status, stream
+│   ├── ChatHistory.tsx    ← updated: notice/error kinds
+│   ├── InputBox.tsx       ← updated: command mode hint
+│   └── ApprovalModal.tsx  ← Phase 5 API kept (onDecision prop, reads pauseReason from store)
+└── app.tsx               ← agent via useMemo, useAgentStore selectors, command dispatch
+```
+
+### 5.6.3. `@agent/cli` — Session model
+
+**`packages/cli/src/session/model.ts`**
+
+```typescript
+export type CliSessionStatus = 'active' | 'paused' | 'completed' | 'failed' | 'cancelled'
+
+export interface CliSession {
+    id: string
+    threadId: string
+    title: string
+    cwd: string
+    model: string
+    stream: boolean
+    createdAt: string   // ISO 8601
+    updatedAt: string   // ISO 8601
+    lastRunId?: string
+    pendingRunId?: string
+    status: CliSessionStatus
+    metadata?: Record<string, unknown>
+}
+```
+
+### 5.6.4. `@agent/cli` — FsSessionStore
+
+**`packages/cli/src/session/fs-session.ts`**
+
+```typescript
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import type { CliSession } from './model.js'
+
+export class FsSessionStore {
+    constructor(private readonly dir: string) {}
+
+    async create(input: Omit<CliSession, 'createdAt' | 'updatedAt'>): Promise<CliSession> {
+        const now = new Date().toISOString()
+        const session: CliSession = { ...input, createdAt: now, updatedAt: now }
+        await this.save(session)
+        return session
+    }
+
+    async save(session: CliSession): Promise<void> {
+        await fs.mkdir(this.dir, { recursive: true })
+        const filePath = this._filePath(session.id)
+        await fs.writeFile(filePath, JSON.stringify(session, null, 2), 'utf8')
+    }
+
+    async load(id: string): Promise<CliSession | undefined> {
+        try {
+            const raw = await fs.readFile(this._filePath(id), 'utf8')
+            return JSON.parse(raw) as CliSession
+        } catch {
+            return undefined
+        }
+    }
+
+    async list(options?: { limit?: number }): Promise<CliSession[]> {
+        await fs.mkdir(this.dir, { recursive: true })
+        const entries = await fs.readdir(this.dir)
+        const sessions: CliSession[] = []
+        for (const entry of entries) {
+            if (!entry.endsWith('.json')) continue
+            try {
+                const raw = await fs.readFile(path.join(this.dir, entry), 'utf8')
+                sessions.push(JSON.parse(raw) as CliSession)
+            } catch {
+                // skip corrupt files
+            }
+        }
+        sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+        return options?.limit ? sessions.slice(0, options.limit) : sessions
+    }
+
+    async delete(id: string): Promise<void> {
+        try {
+            await fs.unlink(this._filePath(id))
+        } catch {
+            // ignore missing file
+        }
+    }
+
+    async loadByPrefix(prefix: string): Promise<
+        { type: 'found'; session: CliSession } |
+        { type: 'ambiguous'; count: number } |
+        { type: 'not-found' }
+    > {
+        const matches = (await this.list()).filter(s => s.id.startsWith(prefix))
+        if (matches.length === 0) return { type: 'not-found' }
+        if (matches.length > 1) return { type: 'ambiguous', count: matches.length }
+        return { type: 'found', session: matches[0]! }
+    }
+
+    private _filePath(id: string): string {
+        return path.join(this.dir, `${id}.json`)
+    }
+}
+```
+
+> Сообщения (MemoryStore) хранятся отдельно по `threadId` — не дублируются в session JSON.
+
+### 5.6.5. `@agent/cli` — Session helpers
+
+**`packages/cli/src/session/helpers.ts`**
+
+```typescript
+import { randomUUID } from 'node:crypto'
+
+export function createSessionId(): string {
+    return randomUUID()
+}
+
+export function createThreadId(sessionId: string): string {
+    return `thread-${sessionId}`
+}
+
+export function getSessionTitle(prompt: string): string {
+    const line = prompt.replace(/[\r\n]+/g, ' ').trim()
+    if (!line) return 'New session'
+    return line.length > 60 ? line.slice(0, 60) : line
+}
+```
+
+IDs are UUID v4 — file-safe by construction (hex + hyphens). No LLM call for title.
+
+### 5.6.6. `@agent/cli` — index.ts additions
+
+```typescript
+// existing exports unchanged ...
+
+// NEW — sessions
+export type { CliSession, CliSessionStatus } from './session/model.js'
+export { FsSessionStore } from './session/fs-session.js'
+export { createSessionId, createThreadId, getSessionTitle } from './session/helpers.js'
+```
+
+### 5.6.7. `apps/cli-app` — Extend `store.ts` (Phase 5 file)
+
+**`apps/cli-app/src/store.ts`** is the Phase 5 file that exports `useAgentStore`. Phase 5.6 **extends it in-place** — no new `store/` directory, no second Zustand store. Add `UiMessage` type and two new slices to the existing `AgentStore` interface and the existing `create(...)` call.
+
+```typescript
+// --- Phase 5.6 additions to apps/cli-app/src/store.ts ---
+
+import type { CliSession } from '@agent/cli'
+
+// New types (add at top of file):
+export type UiMessageKind = 'user' | 'assistant' | 'notice' | 'error'
+
+export interface UiMessage {
+    id: string
+    kind: UiMessageKind
+    text: string
+}
+
+// New fields appended to existing AgentStore interface:
+//
+//   currentSession: CliSession | null
+//   sessions: CliSession[]
+//   uiMessages: UiMessage[]
+//   setCurrentSession(session: CliSession | null): void
+//   setSessions(sessions: CliSession[]): void
+//   addUiMessage(kind: UiMessageKind, text: string): void
+//   clearUiMessages(): void
+//   setPauseReason(pr: PauseReason | null): void   // reuses existing pauseReason field; wraps set()
+
+// Initializer additions inside create(...):
+//
+//   currentSession: null,
+//   sessions: [],
+//   uiMessages: [],
+//   setCurrentSession: (session) => set({ currentSession: session }),
+//   setSessions: (sessions) => set({ sessions }),
+//   addUiMessage: (kind, text) => set(s => ({
+//       uiMessages: [...s.uiMessages, { id: Math.random().toString(36).slice(2), kind, text }]
+//   })),
+//   clearUiMessages: () => set({ uiMessages: [] }),
+//   setPauseReason: (pr) => set({ pauseReason: pr }),
+```
+
+> `useAgentStore` is the single export — unchanged name. `UiMessage` is imported from `'../store.js'` (or `'./store.js'`) by all consumers. No separate types file. UI-only transient state (e.g., text input value) stays local with `useState`.
+
+### 5.6.8. `apps/cli-app` — Slash command parser
+
+**`apps/cli-app/src/commands/parser.ts`**
+
+```typescript
+export type KnownCommandName =
+    | 'help' | 'new' | 'sessions' | 'resume' | 'clear'
+    | 'status' | 'model' | 'stream' | 'tools' | 'cwd'
+    | 'cd' | 'config' | 'exit' | 'quit'
+
+export interface ParsedCommand {
+    name: KnownCommandName | 'unknown'
+    raw: string
+    args: string[]
+}
+
+const KNOWN: Set<string> = new Set([
+    'help', 'new', 'sessions', 'resume', 'clear',
+    'status', 'model', 'stream', 'tools', 'cwd',
+    'cd', 'config', 'exit', 'quit'
+])
+
+export function parseSlashCommand(input: string): ParsedCommand | null {
+    const trimmed = input.trim()
+    if (!trimmed.startsWith('/')) return null
+
+    const parts = trimmed.slice(1).split(/\s+/)
+    const name = parts[0]?.toLowerCase() ?? ''
+    const args = parts.slice(1)
+
+    if (KNOWN.has(name)) {
+        return { name: name as KnownCommandName, raw: trimmed, args }
+    }
+    return { name: 'unknown', raw: trimmed, args: [name, ...args] }
+}
+```
+
+### 5.6.9. `apps/cli-app` — Command registry
+
+**`apps/cli-app/src/commands/registry.ts`**
+
+```typescript
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import type { CliSession } from '@agent/cli'
+import { createSessionId, createThreadId, getSessionTitle, FsSessionStore } from '@agent/cli'
+import type { ParsedCommand } from './parser.js'
+
+export interface CommandContext {
+    session: CliSession | null
+    sessions: CliSession[]
+    model: string
+    apiKey: string | undefined
+    stream: boolean
+    cwd: string
+    sessionStore: FsSessionStore
+    agent: import('@agent/core').IAgent<any>
+    addNotice(text: string): void
+    addError(text: string): void
+    clearMessages(): void
+    setSession(session: CliSession): void
+    setSessions(sessions: CliSession[]): void
+    setModel(model: string): void
+    setStream(on: boolean): void
+    setCwd(cwd: string): void
+    exit(): void
+}
+
+export async function executeCommand(
+    cmd: ParsedCommand,
+    ctx: CommandContext
+): Promise<void> {
+    switch (cmd.name) {
+        case 'help':
+            ctx.addNotice(HELP_TEXT)
+            break
+
+        case 'new': {
+            const id = createSessionId()
+            const threadId = createThreadId(id)
+            const session = await ctx.sessionStore.create({
+                id, threadId,
+                title: 'New session',
+                cwd: ctx.cwd,
+                model: ctx.model,
+                stream: ctx.stream,
+                status: 'active'
+            })
+            ctx.setSession(session)
+            ctx.clearMessages()
+            ctx.addNotice(`Started new session ${id}`)
+            break
+        }
+
+        case 'sessions': {
+            const list = await ctx.sessionStore.list({ limit: 10 })
+            ctx.setSessions(list)
+            if (list.length === 0) {
+                ctx.addNotice('No sessions found.')
+            } else {
+                ctx.addNotice(
+                    list.map(s => `${s.id}  ${s.status.padEnd(10)}  ${s.title}`).join('\n')
+                )
+            }
+            break
+        }
+
+        case 'resume': {
+            const id = cmd.args[0]
+            if (!id) {
+                const list = await ctx.sessionStore.list({ limit: 10 })
+                ctx.setSessions(list)
+                if (list.length === 0) {
+                    ctx.addNotice('No sessions. Use /new to start one.')
+                } else {
+                    ctx.addNotice(
+                        'Recent sessions:\n' +
+                        list.map(s => `  ${s.id}  ${s.status.padEnd(10)}  ${s.title}`).join('\n') +
+                        '\n\nUse /resume <id> to load one.'
+                    )
+                }
+                break
+            }
+            // Try exact match first, then prefix match
+            let loaded: CliSession | undefined = await ctx.sessionStore.load(id)
+            if (!loaded) {
+                const prefixResult = await ctx.sessionStore.loadByPrefix(id)
+                if (prefixResult.type === 'ambiguous') {
+                    ctx.addError(`Ambiguous session id prefix "${id}" matches ${prefixResult.count} sessions. Use a longer prefix.`)
+                    break
+                }
+                if (prefixResult.type === 'not-found') {
+                    ctx.addError(`Session not found: ${id}`)
+                    break
+                }
+                loaded = prefixResult.session
+            }
+            ctx.setSession(loaded)
+            ctx.clearMessages()
+            ctx.addNotice(`Resumed session ${loaded.id}: ${loaded.title}`)
+            break
+        }
+
+        case 'clear':
+            ctx.clearMessages()
+            break
+
+        case 'status': {
+            const s = ctx.session
+            ctx.addNotice(
+                [
+                    `model:      ${ctx.model}`,
+                    `cwd:        ${ctx.cwd}`,
+                    `session:    ${s ? s.id : 'none'}`,
+                    `threadId:   ${s ? s.threadId : 'none'}`,
+                    `stream:     ${ctx.stream}`,
+                    `status:     ${s ? s.status : 'none'}`,
+                    `pendingRun: ${s?.pendingRunId ?? 'none'}`
+                ].join('\n')
+            )
+            break
+        }
+
+        case 'model': {
+            const newModel = cmd.args[0]
+            if (!newModel) {
+                ctx.addNotice(`Current model: ${ctx.model}`)
+            } else {
+                ctx.setModel(newModel)
+                if (ctx.session) {
+                    const updated: CliSession = { ...ctx.session, model: newModel, updatedAt: new Date().toISOString() }
+                    await ctx.sessionStore.save(updated)
+                    ctx.setSession(updated)
+                }
+                ctx.addNotice(`Model set to ${newModel}`)
+            }
+            break
+        }
+
+        case 'stream': {
+            const arg = cmd.args[0]?.toLowerCase()
+            if (arg !== 'on' && arg !== 'off') {
+                ctx.addError('Usage: /stream on|off')
+                break
+            }
+            const on = arg === 'on'
+            ctx.setStream(on)
+            if (ctx.session) {
+                const updated: CliSession = { ...ctx.session, stream: on, updatedAt: new Date().toISOString() }
+                await ctx.sessionStore.save(updated)
+                ctx.setSession(updated)
+            }
+            ctx.addNotice(`Streaming ${on ? 'enabled' : 'disabled'}`)
+            break
+        }
+
+        case 'tools':
+            ctx.addNotice(
+                ctx.agent.tools.map(t => `  ${t.name}${Boolean(t.needsApproval) ? '  [approval]' : ''}`).join('\n')
+            )
+            break
+
+        case 'cwd':
+            ctx.addNotice(`cwd: ${ctx.cwd}`)
+            break
+
+        case 'cd': {
+            const target = cmd.args[0]
+            if (!target) { ctx.addError('Usage: /cd <path>'); break }
+            const resolved = path.resolve(ctx.cwd, target)
+            let stat: import('node:fs').Stats
+            try {
+                stat = await fs.stat(resolved)
+            } catch {
+                ctx.addError(`Directory not found: ${resolved}`)
+                break
+            }
+            if (!stat.isDirectory()) {
+                ctx.addError(`Not a directory: ${resolved}`)
+                break
+            }
+            ctx.setCwd(resolved)
+            if (ctx.session) {
+                const updated: CliSession = { ...ctx.session, cwd: resolved, updatedAt: new Date().toISOString() }
+                await ctx.sessionStore.save(updated)
+                ctx.setSession(updated)
+            }
+            ctx.addNotice(`cwd changed to ${resolved}`)
+            break
+        }
+
+        case 'config':
+            ctx.addNotice(
+                [
+                    `model:   ${ctx.model}`,
+                    `apiKey:  ${ctx.apiKey ? 'present' : 'missing'}`,
+                    `stream:  ${ctx.stream}`,
+                    `cwd:     ${ctx.cwd}`
+                ].join('\n')
+            )
+            break
+
+        case 'exit':
+        case 'quit':
+            ctx.exit()
+            break
+
+        case 'unknown':
+        default:
+            ctx.addError(`Unknown command: ${cmd.raw}. Type /help for available commands.`)
+            break
+    }
+}
+
+const HELP_TEXT = `
+Available commands:
+  /help               Show this help
+  /new                Start a new session
+  /sessions           List recent sessions
+  /resume [id]        Resume session by id (omit id to list; prefix match supported)
+  /clear              Clear chat display (memory unchanged)
+  /status             Show current session info
+  /model [id]         Show or set model
+  /stream on|off      Enable or disable streaming
+  /tools              List available tools
+  /cwd                Show current working directory
+  /cd <path>          Change working directory (must exist and be a directory)
+  /config             Show config (api key hidden)
+  /exit, /quit        Exit the app
+`.trim()
+```
+
+### 5.6.10. `apps/cli-app` — App state and startup
+
+**`apps/cli-app/src/app.tsx`** (additions and changes — existing structure from Phase 5 kept):
+
+```typescript
+import React, { useCallback, useState } from 'react'
+import { useApp } from 'ink'
+import * as path from 'node:path'
+import * as os from 'node:os'
+import { createOpenAI } from '@agent/openai'
+import type { CliSession } from '@agent/cli'
+import {
+    createCliAgent, createCliContext, createCliTools, getDefaultCliSystemPrompt,
+    FsMemoryStore, FsCheckpointStore, FsSessionStore,
+    createSessionId, createThreadId, getSessionTitle
+} from '@agent/cli'
+import { useAgentStore } from './store.js'
+import { parseSlashCommand } from './commands/parser.js'
+import { executeCommand } from './commands/registry.js'
+import { useAgent } from './hooks/useAgent.js'
+import { StatusBar } from './components/StatusBar.js'
+import { ChatHistory } from './components/ChatHistory.js'
+import { InputBox } from './components/InputBox.js'
+import { ApprovalModal } from './components/ApprovalModal.js'
+
+// No agent prop — agent created internally via useMemo
+interface AppProps {
+    model: string
+    apiKey: string | undefined
+    baseURL?: string
+    stream?: boolean
+}
+
+export default function App({ model: initialModel, apiKey, baseURL, stream: initialStream }: AppProps) {
+    const { exit } = useApp()
+
+    // Session/message state from the extended Phase 5 Zustand store
+    const {
+        pauseReason, pendingRunId,
+        currentSession, setCurrentSession, sessions, setSessions,
+        uiMessages, addUiMessage, clearUiMessages,
+        setPauseReason
+    } = useAgentStore()
+
+    // UI config kept in local state (model/stream/cwd change via slash commands, not app re-mount)
+    const [model, setModel] = useState(initialModel)
+    const [stream, setStream] = useState(initialStream ?? true)
+    const [cwd, setCwd] = useState(() => process.cwd())
+
+    const dataDir = React.useMemo(() => path.join(os.homedir(), '.agent'), [])
+    const sessionStore    = React.useMemo(() => new FsSessionStore(path.join(dataDir, 'sessions')), [dataDir])
+    const memoryStore     = React.useMemo(() => new FsMemoryStore(path.join(dataDir, 'memory')), [dataDir])
+    const checkpointStore = React.useMemo(() => new FsCheckpointStore(path.join(dataDir, 'checkpoints')), [dataDir])
+    const context = React.useMemo(() => createCliContext({ cwd }), [cwd])
+    const tools   = React.useMemo(() => createCliTools(), [])
+
+    // agent = null when apiKey is missing; useAgent is null-safe
+    const agent = React.useMemo(() => {
+        if (!apiKey) return null
+        return createCliAgent({
+            name: 'cli-agent',
+            engine: createOpenAI({ apiKey, baseURL }).engine(model),
+            system: getDefaultCliSystemPrompt(cwd),
+            tools,
+            memory: memoryStore,
+            checkpoints: checkpointStore
+        })
+        // cwd dep: system prompt changes with /cd; model dep: /model recreates engine
+    }, [model, apiKey, baseURL, cwd, tools, memoryStore, checkpointStore])
+
+    // Show error notice on startup if apiKey missing
+    React.useEffect(() => {
+        if (!apiKey) addUiMessage('error', 'No API key configured. Set OPENAI_API_KEY or pass --api-key.')
+    }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+    const addNotice = (text: string) => addUiMessage('notice', text)
+    const addError  = (text: string) => addUiMessage('error', text)
+
+    const ensureSession = useCallback(async (firstPrompt: string): Promise<CliSession> => {
+        if (currentSession) return currentSession
+        const id = createSessionId()
+        const threadId = createThreadId(id)
+        const title = getSessionTitle(firstPrompt)
+        const session = await sessionStore.create({
+            id, threadId, title, cwd, model, stream, status: 'active'
+        })
+        setCurrentSession(session)
+        return session
+    }, [currentSession, cwd, model, stream, sessionStore, setCurrentSession])
+
+    const { submitPrompt, resolveApproval, isRunning } = useAgent(
+        agent, context, stream, currentSession,
+        { onSessionUpdate: setCurrentSession, onPauseReason: setPauseReason, onError: addError, sessionStore }
+    )
+
+    // ApprovalModal uses Phase 5 onDecision API and reads pauseReason from store
+    const handleApproval = useCallback((decision: 'allow' | 'deny') => {
+        resolveApproval(decision)
+    }, [resolveApproval])
+
+    const handleSubmit = async (input: string) => {
+        const cmd = parseSlashCommand(input)
+        if (cmd) {
+            await executeCommand(cmd, {
+                session: currentSession, sessions, model, apiKey, stream, cwd,
+                sessionStore, agent,
+                addNotice, addError,
+                clearMessages: clearUiMessages,
+                setSession: setCurrentSession, setSessions, setModel, setStream, setCwd, exit
+            })
+            return
+        }
+
+        // Normal prompt — passes full session so useAgent extracts threadId without stale closure
+        addUiMessage('user', input)
+        const session = await ensureSession(input)
+        submitPrompt(input, session)
+    }
+
+    return (
+        <Box flexDirection="column" height="100%">
+            <StatusBar model={model} cwd={cwd} session={currentSession} stream={stream} isRunning={isRunning} />
+            <ChatHistory messages={uiMessages} agentEvents={[]} />
+            {pauseReason ? (
+                <ApprovalModal onDecision={handleApproval} />
+            ) : (
+                <InputBox onSubmit={handleSubmit} isRunning={isRunning} />
+            )}
+        </Box>
+    )
+}
+```
+
+> **Provider**: `createOpenAI({ apiKey, baseURL }).engine(model)` — same pattern as Phase 5, no raw SDK imports in `cli-app`. Agent deps include `cwd` so `/cd` → agent recreates → new system prompt for next prompt. Agent is `null` when `apiKey` is missing; `useAgent` is null-safe and `submitPrompt` is a no-op in that case.
+>
+> **ApprovalModal**: the Phase 5 component API is **kept** — `onDecision` prop, reads `pauseReason` from `useAgentStore()`. `useAgent` writes `pauseReason` to the store via `onPauseReason` callback. No migration of the component required.
+
+### 5.6.11. `apps/cli-app` — useAgent hook (updated)
+
+**`apps/cli-app/src/hooks/useAgent.ts`**
+
+```typescript
+import React from 'react'
+import type { IAgent, AgentEvent } from '@agent/core'
+import type { CliContext, CliSession, FsSessionStore } from '@agent/cli'
+import type { PauseReason } from '@agent/core'
+
+interface UseAgentOptions {
+    onSessionUpdate(session: CliSession): void
+    onPauseReason(pr: PauseReason | null): void  // writes to store so ApprovalModal can read it
+    onError(msg: string): void
+    sessionStore: FsSessionStore
+}
+
+export function useAgent(
+    agent: IAgent<CliContext> | null,  // null when apiKey is missing
+    context: CliContext,
+    stream: boolean,
+    currentSession: CliSession | null,
+    options: UseAgentOptions
+) {
+    const [isRunning, setIsRunning] = React.useState(false)
+    const [agentEvents, setAgentEvents] = React.useState<AgentEvent[]>([])
+
+    // Refs keep latest values accessible inside handleEvent without stale closure
+    const sessionRef = React.useRef<CliSession | null>(currentSession)
+    React.useEffect(() => { sessionRef.current = currentSession }, [currentSession])
+
+    const optionsRef = React.useRef(options)
+    React.useEffect(() => { optionsRef.current = options }, [options])
+
+    // Stores the PauseReason from the last approval.requested event — used by resolveApproval
+    const approvalRef = React.useRef<PauseReason | null>(null)
+
+    // updateSession: reads from sessionRef, patches, updates ref immediately, notifies store, persists.
+    // Updating the ref immediately prevents run.started/approval.requested/run.completed from
+    // overwriting each other before React re-renders.
+    const updateSession = React.useCallback((patch: Partial<CliSession>) => {
+        const session = sessionRef.current
+        if (!session) return
+        const updated: CliSession = { ...session, ...patch, updatedAt: new Date().toISOString() }
+        sessionRef.current = updated  // immediate update prevents stale base in next event
+        optionsRef.current.onSessionUpdate(updated)
+        optionsRef.current.sessionStore.save(updated).catch(() => {})
+    }, []) // stable — reads/writes via refs
+
+    const handleEvent = React.useCallback((event: AgentEvent) => {
+        setAgentEvents(prev => [...prev, event])
+
+        if (event.type === 'run.started') {
+            updateSession({ lastRunId: event.runId })
+        }
+
+        if (event.type === 'approval.requested') {
+            // Build PauseReason from event fields — do NOT read event.pauseReason
+            const pauseReason: PauseReason = {
+                type: 'approval_required',
+                approvalId: event.approvalId,
+                toolCallId: event.toolCallId,
+                toolName: event.toolName,
+                input: event.input,
+                message: event.message
+            }
+            approvalRef.current = pauseReason
+            optionsRef.current.onPauseReason(pauseReason)  // writes to store → ApprovalModal renders
+            updateSession({ pendingRunId: event.runId, status: 'paused' })
+        }
+
+        if (event.type === 'run.completed') {
+            approvalRef.current = null
+            optionsRef.current.onPauseReason(null)
+            updateSession({ pendingRunId: undefined, status: 'completed' })
+        }
+
+        if (event.type === 'run.failed') {
+            approvalRef.current = null
+            optionsRef.current.onPauseReason(null)
+            updateSession({ status: 'failed' })
+        }
+
+        if (event.type === 'run.cancelled') {
+            approvalRef.current = null
+            optionsRef.current.onPauseReason(null)
+            updateSession({ status: 'cancelled' })
+        }
+    }, [updateSession]) // stable — updateSession is also stable
+
+    // agent.execute returns AsyncGenerator<AgentEvent, RunResult> — iterate with for await
+    // submitPrompt is a no-op when agent is null (missing apiKey)
+    const submitPrompt = React.useCallback((prompt: string, session: CliSession) => {
+        if (!agent) return
+        setIsRunning(true)
+        setAgentEvents([]);
+        (async () => {
+            try {
+                for await (const event of agent.execute(prompt, { context, threadId: session.threadId, stream })) {
+                    handleEvent(event)
+                }
+            } catch (err) {
+                optionsRef.current.onError(err instanceof Error ? err.message : String(err))
+            } finally {
+                setIsRunning(false)
+            }
+        })()
+    }, [agent, context, stream, handleEvent])
+
+    // agent.resume returns Promise<RunResult> — called with await, onEvent passed as callback
+    const resolveApproval = React.useCallback((decision: 'allow' | 'deny') => {
+        const currentApproval = approvalRef.current
+        const session = sessionRef.current
+        if (!agent || !currentApproval || !session?.pendingRunId) {
+            if (!agent) optionsRef.current.onError('No agent configured (missing API key)')
+            else if (!session?.pendingRunId) optionsRef.current.onError('No pending run to resume')
+            return
+        }
+        const pendingRunId = session.pendingRunId
+        setIsRunning(true);
+        (async () => {
+            try {
+                await agent.resume(
+                    pendingRunId,
+                    { approvalId: currentApproval.approvalId, decision },
+                    { context, stream, onEvent: handleEvent }
+                )
+            } catch (err) {
+                optionsRef.current.onError(err instanceof Error ? err.message : String(err))
+            } finally {
+                setIsRunning(false)
+            }
+        })()
+    }, [agent, context, stream, handleEvent])
+
+    return { isRunning, agentEvents, submitPrompt, resolveApproval }
+}
+```
+
+> **API contracts**: `agent.execute` → `AsyncGenerator<AgentEvent, RunResult>`, iterated with `for await`. `agent.resume` → `Promise<RunResult>`, called with `await` + `onEvent: handleEvent`. `useAgent` accepts `null` agent (no-op). `updateSession` updates `sessionRef` immediately to avoid race between run events. `onPauseReason` writes to the store so `ApprovalModal` (which reads from `useAgentStore`) can react.
+
+### 5.6.12. `apps/cli-app` — UI components (updated)
+
+**`StatusBar.tsx`** additions:
+
+```typescript
+interface StatusBarProps {
+    model: string
+    cwd: string
+    session: CliSession | null
+    stream: boolean
+    isRunning: boolean
+    step?: number
+    totalTokens?: number
+}
+
+// Display: model | basename(cwd) | session-title-or-short-id | status | stream:on/off | [running] | tokens
+function StatusBar({ model, cwd, session, stream, isRunning, step, totalTokens }: StatusBarProps) {
+    const cwdBase = path.basename(cwd) || cwd
+    const sessionLabel = session
+        ? (session.title !== 'New session' ? session.title.slice(0, 20) : session.id.slice(0, 8))
+        : 'no session'
+    const statusLabel = session?.status ?? ''
+
+    return (
+        <Box borderStyle="single" paddingX={1}>
+            <Text color="cyan">{model}</Text>
+            <Text> | </Text>
+            <Text color="yellow">{cwdBase}</Text>
+            <Text> | </Text>
+            <Text color="green">{sessionLabel}</Text>
+            {statusLabel ? <Text color="gray"> [{statusLabel}]</Text> : null}
+            <Text> | stream:{stream ? 'on' : 'off'}</Text>
+            {isRunning ? <Text color="magenta"> [running]</Text> : null}
+            {totalTokens ? <Text color="gray"> tokens:{totalTokens}</Text> : null}
+        </Box>
+    )
+}
+```
+
+**`ChatHistory.tsx`** — support `UiMessage` kinds:
+
+```typescript
+import type { UiMessage } from '../store/types.js'
+
+function kindColor(kind: UiMessage['kind']): string {
+    switch (kind) {
+        case 'user':      return 'white'
+        case 'assistant': return 'green'
+        case 'notice':    return 'cyan'
+        case 'error':     return 'red'
+    }
+}
+
+function kindPrefix(kind: UiMessage['kind']): string {
+    switch (kind) {
+        case 'user':      return '> '
+        case 'assistant': return ''
+        case 'notice':    return '• '
+        case 'error':     return '✗ '
+    }
+}
+```
+
+**`InputBox.tsx`** — command mode hint:
+
+```typescript
+// If value starts with '/', show dim hint text below input:
+// "Command mode — type /help for available commands"
+```
+
+### 5.6.13. Tests — `@agent/cli`
+
+**`packages/cli/src/session/__tests__/fs-session.test.ts`**
+
+```typescript
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import * as fs from 'node:fs/promises'
+import * as path from 'node:path'
+import * as os from 'node:os'
+import { FsSessionStore } from '../fs-session.js'
+
+describe('FsSessionStore', () => {
+    let tmpDir: string
+    let store: FsSessionStore
+
+    beforeEach(async () => {
+        tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agent-sessions-'))
+        store = new FsSessionStore(tmpDir)
+    })
+    afterEach(async () => { await fs.rm(tmpDir, { recursive: true, force: true }) })
+
+    it('create and load round-trips', async () => {
+        const s = await store.create({ id: 'abc', threadId: 'thread-abc', title: 'T', cwd: '/tmp', model: 'm', stream: true, status: 'active' })
+        const loaded = await store.load('abc')
+        expect(loaded).toMatchObject({ id: 'abc', title: 'T' })
+        expect(loaded?.createdAt).toBeTruthy()
+    })
+
+    it('save updates updatedAt', async () => {
+        const s = await store.create({ id: 'x', threadId: 'thread-x', title: 'X', cwd: '/', model: 'm', stream: false, status: 'active' })
+        const updated = { ...s, title: 'Updated', updatedAt: new Date().toISOString() }
+        await store.save(updated)
+        const loaded = await store.load('x')
+        expect(loaded?.title).toBe('Updated')
+    })
+
+    it('list sorted by updatedAt desc', async () => {
+        await store.create({ id: 'a', threadId: 'ta', title: 'A', cwd: '/', model: 'm', stream: true, status: 'active' })
+        await new Promise(r => setTimeout(r, 5))
+        await store.create({ id: 'b', threadId: 'tb', title: 'B', cwd: '/', model: 'm', stream: true, status: 'active' })
+        const list = await store.list()
+        expect(list[0]?.id).toBe('b')
+        expect(list[1]?.id).toBe('a')
+    })
+
+    it('list with limit', async () => {
+        for (let i = 0; i < 5; i++) {
+            await store.create({ id: `s${i}`, threadId: `t${i}`, title: `S${i}`, cwd: '/', model: 'm', stream: true, status: 'active' })
+            await new Promise(r => setTimeout(r, 2))
+        }
+        const list = await store.list({ limit: 3 })
+        expect(list).toHaveLength(3)
+    })
+
+    it('load returns undefined for missing id', async () => {
+        expect(await store.load('nonexistent')).toBeUndefined()
+    })
+
+    it('delete removes file', async () => {
+        await store.create({ id: 'del', threadId: 'tdel', title: 'D', cwd: '/', model: 'm', stream: true, status: 'active' })
+        await store.delete('del')
+        expect(await store.load('del')).toBeUndefined()
+    })
+
+    it('ids are file-safe (UUID format)', async () => {
+        const { createSessionId } = await import('../helpers.js')
+        const id = createSessionId()
+        expect(id).toMatch(/^[0-9a-f-]+$/)
+    })
+})
+```
+
+**`packages/cli/src/session/__tests__/helpers.test.ts`**
+
+```typescript
+import { describe, it, expect } from 'vitest'
+import { getSessionTitle, createThreadId } from '../helpers.js'
+
+describe('getSessionTitle', () => {
+    it('returns first 60 chars of single-line prompt', () => {
+        const long = 'a'.repeat(100)
+        expect(getSessionTitle(long)).toHaveLength(60)
+    })
+
+    it('collapses newlines to space', () => {
+        expect(getSessionTitle('hello\nworld')).toBe('hello world')
+    })
+
+    it('returns "New session" for empty input', () => {
+        expect(getSessionTitle('')).toBe('New session')
+        expect(getSessionTitle('   \n  ')).toBe('New session')
+    })
+
+    it('createThreadId format', () => {
+        expect(createThreadId('abc')).toBe('thread-abc')
+    })
+})
+```
+
+### 5.6.14. Tests — `apps/cli-app`
+
+**`apps/cli-app/src/commands/__tests__/parser.test.ts`**
+
+```typescript
+import { describe, it, expect } from 'vitest'
+import { parseSlashCommand } from '../parser.js'
+
+describe('parseSlashCommand', () => {
+    it('returns null for normal text', () => {
+        expect(parseSlashCommand('hello')).toBeNull()
+        expect(parseSlashCommand('')).toBeNull()
+    })
+
+    it('parses /resume with id', () => {
+        const cmd = parseSlashCommand('/resume abc123')
+        expect(cmd?.name).toBe('resume')
+        expect(cmd?.args).toEqual(['abc123'])
+    })
+
+    it('parses /stream on', () => {
+        const cmd = parseSlashCommand('/stream on')
+        expect(cmd?.name).toBe('stream')
+        expect(cmd?.args).toEqual(['on'])
+    })
+
+    it('parses /stream off', () => {
+        const cmd = parseSlashCommand('/stream off')
+        expect(cmd?.name).toBe('stream')
+        expect(cmd?.args).toEqual(['off'])
+    })
+
+    it('parses /model with id', () => {
+        const cmd = parseSlashCommand('/model gpt-4o')
+        expect(cmd?.name).toBe('model')
+        expect(cmd?.args).toEqual(['gpt-4o'])
+    })
+
+    it('returns unknown for unrecognized command', () => {
+        const cmd = parseSlashCommand('/foobar')
+        expect(cmd?.name).toBe('unknown')
+        expect(cmd?.args[0]).toBe('foobar')
+    })
+
+    it('is case-insensitive for command name', () => {
+        expect(parseSlashCommand('/HELP')?.name).toBe('help')
+        expect(parseSlashCommand('/New')?.name).toBe('new')
+    })
+})
+```
+
+**`apps/cli-app/src/commands/__tests__/registry.test.ts`**
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { executeCommand } from '../registry.js'
+import { parseSlashCommand } from '../parser.js'
+import type { CommandContext } from '../registry.js'
+
+function makeCtx(overrides: Partial<CommandContext> = {}): CommandContext {
+    return {
+        session: null,
+        sessions: [],
+        model: 'claude-opus-4-7',
+        apiKey: 'sk-test',
+        stream: true,
+        cwd: '/tmp',
+        sessionStore: {
+            create: vi.fn().mockResolvedValue({ id: 'new-id', threadId: 'thread-new-id', title: 'X', cwd: '/tmp', model: 'claude-opus-4-7', stream: true, status: 'active', createdAt: '', updatedAt: '' }),
+            save: vi.fn().mockResolvedValue(undefined),
+            load: vi.fn().mockResolvedValue(undefined),
+            list: vi.fn().mockResolvedValue([]),
+            delete: vi.fn().mockResolvedValue(undefined)
+        } as any,
+        agent: { tools: [] } as any,
+        addNotice: vi.fn(),
+        addError: vi.fn(),
+        clearMessages: vi.fn(),
+        setSession: vi.fn(),
+        setSessions: vi.fn(),
+        setModel: vi.fn(),
+        setStream: vi.fn(),
+        setCwd: vi.fn(),
+        exit: vi.fn(),
+        ...overrides
+    }
+}
+
+describe('command registry', () => {
+    it('/new creates session and clears messages', async () => {
+        const ctx = makeCtx()
+        await executeCommand(parseSlashCommand('/new')!, ctx)
+        expect(ctx.sessionStore.create).toHaveBeenCalled()
+        expect(ctx.clearMessages).toHaveBeenCalled()
+        expect(ctx.setSession).toHaveBeenCalled()
+    })
+
+    it('/resume loads session by id', async () => {
+        const loaded = { id: 'abc', threadId: 'thread-abc', title: 'T', cwd: '/', model: 'm', stream: true, status: 'active', createdAt: '', updatedAt: '' }
+        const ctx = makeCtx({ sessionStore: { load: vi.fn().mockResolvedValue(loaded) } as any })
+        await executeCommand(parseSlashCommand('/resume abc')!, ctx)
+        expect(ctx.setSession).toHaveBeenCalledWith(loaded)
+        expect(ctx.clearMessages).toHaveBeenCalled()
+    })
+
+    it('/resume with missing id shows error', async () => {
+        const ctx = makeCtx({ sessionStore: { load: vi.fn().mockResolvedValue(undefined), list: vi.fn().mockResolvedValue([]) } as any })
+        await executeCommand(parseSlashCommand('/resume missing')!, ctx)
+        expect(ctx.addError).toHaveBeenCalledWith(expect.stringContaining('not found'))
+    })
+
+    it('/clear clears messages only', async () => {
+        const ctx = makeCtx()
+        await executeCommand(parseSlashCommand('/clear')!, ctx)
+        expect(ctx.clearMessages).toHaveBeenCalled()
+        expect(ctx.setSession).not.toHaveBeenCalled()
+    })
+
+    it('/config masks api key', async () => {
+        const ctx = makeCtx({ apiKey: 'sk-secret' })
+        await executeCommand(parseSlashCommand('/config')!, ctx)
+        const notice: string = (ctx.addNotice as ReturnType<typeof vi.fn>).mock.calls[0][0]
+        expect(notice).toContain('present')
+        expect(notice).not.toContain('sk-secret')
+    })
+
+    it('/cd resolves path and updates cwd', async () => {
+        const ctx = makeCtx({ cwd: '/home/user' })
+        await executeCommand(parseSlashCommand('/cd projects')!, ctx)
+        expect(ctx.setCwd).toHaveBeenCalledWith(expect.stringContaining('projects'))
+    })
+
+    it('/model without arg shows current model', async () => {
+        const ctx = makeCtx({ model: 'claude-opus-4-7' })
+        await executeCommand(parseSlashCommand('/model')!, ctx)
+        const notice: string = (ctx.addNotice as ReturnType<typeof vi.fn>).mock.calls[0][0]
+        expect(notice).toContain('claude-opus-4-7')
+    })
+
+    it('/stream off disables streaming', async () => {
+        const ctx = makeCtx({ stream: true })
+        await executeCommand(parseSlashCommand('/stream off')!, ctx)
+        expect(ctx.setStream).toHaveBeenCalledWith(false)
+    })
+
+    it('/stream with bad arg shows error', async () => {
+        const ctx = makeCtx()
+        await executeCommand(parseSlashCommand('/stream maybe')!, ctx)
+        expect(ctx.addError).toHaveBeenCalled()
+    })
+})
+```
+
+**`apps/cli-app/src/hooks/__tests__/useAgent.test.ts`**
+
+```typescript
+import { describe, it, expect, vi } from 'vitest'
+import { renderHook, act } from '@testing-library/react'
+import { useAgent } from '../useAgent.js'
+import type { CliContext, CliSession } from '@agent/cli'
+
+// agent.execute returns AsyncGenerator<AgentEvent, RunResult>
+async function* makeExecuteGen(events: any[] = []) {
+    for (const event of events) yield event
+    return {} // RunResult
+}
+
+async function* makeThrowingGen() {
+    throw new Error('boom')
+    yield undefined as any
+}
+
+function makeAgent(events: any[] = [], throwOnExecute = false) {
+    return {
+        execute: vi.fn(() => throwOnExecute ? makeThrowingGen() : makeExecuteGen(events)),
+        // agent.resume returns Promise<RunResult>, not AsyncGenerator
+        resume: vi.fn().mockResolvedValue({}),
+        tools: []
+    } as any
+}
+
+function makeSession(overrides: Partial<CliSession> = {}): CliSession {
+    return {
+        id: 'sid', threadId: 'thread-sid', title: 'T', cwd: '/', model: 'm',
+        stream: true, status: 'active', createdAt: '', updatedAt: '', ...overrides
+    }
+}
+
+const context = {} as CliContext
+const baseOptions = {
+    onSessionUpdate: vi.fn(),
+    onError: vi.fn(),
+    sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any
+}
+
+describe('useAgent', () => {
+    it('submitPrompt passes session.threadId to agent.execute', async () => {
+        const agent = makeAgent()
+        const session = makeSession()
+        const { result } = renderHook(() => useAgent(agent, context, true, session, baseOptions))
+        act(() => { result.current.submitPrompt('hello', session) })
+        await vi.waitFor(() =>
+            expect(agent.execute).toHaveBeenCalledWith('hello', expect.objectContaining({ threadId: 'thread-sid' }))
+        )
+    })
+
+    it('execute error becomes onError, not unhandled rejection', async () => {
+        const agent = makeAgent([], true)
+        const session = makeSession()
+        const opts = { ...baseOptions, onError: vi.fn() }
+        const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
+        act(() => { result.current.submitPrompt('hello', session) })
+        await vi.waitFor(() => expect(opts.onError).toHaveBeenCalledWith('boom'))
+    })
+
+    it('approval.requested sets approval from event fields (not event.pauseReason)', async () => {
+        const approvalEvent = {
+            type: 'approval.requested',
+            runId: 'run-1',
+            approvalId: 'ap1',
+            toolCallId: 'tc1',
+            toolName: 'shell_exec',
+            input: { command: 'ls' },
+            message: undefined
+        }
+        const agent = makeAgent([approvalEvent])
+        const session = makeSession()
+        const opts = {
+            onSessionUpdate: vi.fn(),
+            onError: vi.fn(),
+            sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any
+        }
+        const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
+        act(() => { result.current.submitPrompt('hello', session) })
+        await vi.waitFor(() => expect(result.current.approval).not.toBeNull())
+        expect(result.current.approval?.approvalId).toBe('ap1')
+        expect(result.current.approval?.toolName).toBe('shell_exec')
+        expect(opts.onSessionUpdate).toHaveBeenCalledWith(
+            expect.objectContaining({ status: 'paused', pendingRunId: 'run-1' })
+        )
+    })
+
+    it('run.completed clears pendingRunId and sets status completed', async () => {
+        const completedEvent = { type: 'run.completed', runId: 'run-1' }
+        const agent = makeAgent([completedEvent])
+        const session = makeSession({ pendingRunId: 'run-1', status: 'paused' })
+        const opts = {
+            onSessionUpdate: vi.fn(),
+            onError: vi.fn(),
+            sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any
+        }
+        const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
+        act(() => { result.current.submitPrompt('hello', session) })
+        await vi.waitFor(() =>
+            expect(opts.onSessionUpdate).toHaveBeenCalledWith(
+                expect.objectContaining({ status: 'completed', pendingRunId: undefined })
+            )
+        )
+    })
+
+    it('resolveApproval calls agent.resume with onEvent callback (not for-await)', async () => {
+        // First get approval state set via an approval event
+        const approvalEvent = {
+            type: 'approval.requested', runId: 'run-1',
+            approvalId: 'ap1', toolCallId: 'tc1', toolName: 'shell_exec', input: {}
+        }
+        const agent = makeAgent([approvalEvent])
+        const session = makeSession({ pendingRunId: 'run-1' })
+        const opts = {
+            onSessionUpdate: vi.fn(),
+            onError: vi.fn(),
+            sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any
+        }
+        const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
+        act(() => { result.current.submitPrompt('hello', session) })
+        await vi.waitFor(() => expect(result.current.approval).not.toBeNull())
+        act(() => { result.current.resolveApproval('allow') })
+        await vi.waitFor(() =>
+            expect(agent.resume).toHaveBeenCalledWith(
+                'run-1',
+                { approvalId: 'ap1', decision: 'allow' },
+                expect.objectContaining({ onEvent: expect.any(Function) })
+            )
+        )
+    })
+
+    it('resolveApproval shows error if pendingRunId missing', async () => {
+        const agent = makeAgent()
+        const session = makeSession({ pendingRunId: undefined })
+        const opts = { ...baseOptions, onError: vi.fn() }
+        const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
+        // resolveApproval with no approval state — approval is null, so returns early without calling resume
+        act(() => { result.current.resolveApproval('allow') })
+        expect(agent.resume).not.toHaveBeenCalled()
+    })
+})
+```
+
+### 5.6.15. Checklist Phase 5.6
+
+**`@agent/cli` — session store**
+- [ ] `CliSession` / `CliSessionStatus` — exported from `@agent/cli`
+- [ ] `FsSessionStore.create/load/save/list/delete` — list sorted by `updatedAt` desc; file-safe IDs (UUID)
+- [ ] `FsSessionStore.loadByPrefix(prefix)` — returns `{ type: 'found'; session } | { type: 'ambiguous'; count } | { type: 'not-found' }`; ambiguous if prefix matches >1 session
+- [ ] `createSessionId` / `createThreadId` / `getSessionTitle` — exported from `@agent/cli`
+- [ ] `getSessionTitle` — deterministic, no LLM call, ≤60 chars, collapses newlines, fallback "New session"
+
+**`apps/cli-app` — store and types**
+- [ ] `UiMessage` / `UiMessageKind` defined in `store/types.ts`, not in `app.tsx`; imported from `store/types.ts` by all consumers
+- [ ] Phase 5 Zustand store extended with `SessionSlice` + `MessagesSlice` — no `useState` for session/messages data
+
+**`apps/cli-app` — command parser and registry**
+- [ ] `parseSlashCommand` — returns `ParsedCommand | null`; case-insensitive name; unknown → `{ name: 'unknown' }`
+- [ ] `CommandContext.apiKey` typed as `string | undefined`
+- [ ] `/config` — masks apiKey (shows `present` / `missing`, never the value)
+- [ ] `/stream on|off` — validates arg, shows error on bad input
+- [ ] `/resume <id>` — exact match via `load`, then prefix match via `loadByPrefix`; shows full session id; ambiguous prefix → error with count; missing → error
+- [ ] `/resume` with no id — lists recent sessions with full ids
+- [ ] `/new` — creates session + threadId, clears UI messages
+- [ ] `/cd` — resolves path, checks `fs.stat` (errors if missing or not a directory); after cwd change: `context` and `agent` useMemos recreate → next prompt uses new cwd and updated system prompt
+- [ ] `/model` no arg — shows current; with arg — sets model; agent useMemo recreates → next prompt uses new model
+- [ ] `/tools` — uses `Boolean(t.needsApproval)`
+
+**`apps/cli-app` — App**
+- [ ] `App` has no `agent` prop; agent created via `createCliAgent(config)` inside `React.useMemo`
+- [ ] Agent config: `engine` = `OpenAIEngine`, `system` = `getDefaultCliSystemPrompt(cwd)`, `memory` = `FsMemoryStore`, `checkpoints` = `FsCheckpointStore`, `tools`
+- [ ] Agent useMemo deps include `model`, `apiKey`, `baseURL`, `cwd`, `tools`, `memoryStore`, `checkpointStore`
+- [ ] `submitPrompt(input, session)` receives full `CliSession` — threadId extracted inside `useAgent`, no stale closure
+- [ ] `ensureSession` — creates session lazily on first prompt if none active
+
+**`apps/cli-app` — useAgent**
+- [ ] `UseAgentOptions`: `onSessionUpdate`, `onError`, `sessionStore` only
+- [ ] `handleEvent` reads session/options via `sessionRef` / `optionsRef` — stable callback, no stale closure
+- [ ] `submitPrompt(prompt, session)` — async IIFE, `for await (event of agent.execute(prompt, { context, threadId: session.threadId, stream }))`, errors → `onError`
+- [ ] `resolveApproval` — `await agent.resume(pendingRunId, { approvalId, decision }, { context, stream, onEvent: handleEvent })`; errors if `pendingRunId` missing or agent throws
+- [ ] `approval.requested` event: builds `PauseReason` from `event.approvalId/toolCallId/toolName/input/message` directly — not `event.pauseReason`
+- [ ] `run.completed` → clears `pendingRunId`, sets `status: completed`, saves session
+- [ ] `run.failed` / `run.cancelled` → updates session status, saves session
+- [ ] No access to agent private fields
+
+**`apps/cli-app` — UI**
+- [ ] `StatusBar` — model, cwd basename, session title/short-id, status, stream indicator, running state
+- [ ] `ChatHistory` — `user` / `assistant` / `notice` / `error` kinds with distinct colors; imports `UiMessage` from `store/types.ts`
+- [ ] `InputBox` — command mode hint when input starts with `/`
+- [ ] `ApprovalModal` — props unchanged from Phase 5 (`approval: PauseReason`, `onResolve: (decision) => void`)
+
+**Persistence**
+- [ ] Session metadata in `FsSessionStore`; messages in `FsMemoryStore` by `threadId` — no duplication
+
+**Tests**
+- [ ] `FsSessionStore` — CRUD + list sort + limit + missing load + delete
+- [ ] `FsSessionStore.loadByPrefix` — found / ambiguous / not-found cases
+- [ ] `getSessionTitle` — empty, long, newlines
+- [ ] `parseSlashCommand` — known, unknown, case-insensitive, with/without args
+- [ ] Registry — `/new`, `/resume` (found/ambiguous/missing), `/clear`, `/config`, `/cd`, `/model`, `/stream`
+- [ ] `useAgent` — `submitPrompt` passes `session.threadId`; error → `onError`; approval fields (not `.pauseReason`); completed event; `resolveApproval` calls `agent.resume` with `onEvent`
+
+**Verification**
+- `npx nx run @agent/cli:test --skip-nx-cache`
+- `npx nx run @agent/cli:typecheck --skip-nx-cache`
+- `npx nx run @agent/cli:build --skip-nx-cache`
+- `npx nx run @agent/cli-app:typecheck --skip-nx-cache`
+- `npx nx run @agent/cli-app:build --skip-nx-cache`
 
 ---
 
