@@ -1,0 +1,42 @@
+{
+    "name": "@agent/cli-app",
+    "$schema": "../../node_modules/nx/schemas/project-schema.json",
+    "sourceRoot": "apps/cli-app/src",
+    "projectType": "application",
+    "tags": ["scope:app", "type:app"],
+    "implicitDependencies": ["@agent/core", "@agent/cli", "@agent/openai"],
+    "targets": {
+        "typecheck": {
+            "executor": "nx:run-commands",
+            "dependsOn": ["^build"],
+            "options": {
+                "command": "npx tsc --noEmit -p apps/cli-app/tsconfig.json"
+            }
+        },
+        "nx-release-publish": {
+            "options": {
+                "packageRoot": "dist/apps/cli-app"
+            }
+        },
+        "build": {
+            "executor": "@nx/esbuild:esbuild",
+            "outputs": ["{options.outputPath}"],
+            "options": {
+                "main": "./apps/cli-app/src/cli.tsx",
+                "outputPath": "dist/apps/cli-app",
+                "outputFileName": "cli.js",
+                "tsConfig": "apps/cli-app/tsconfig.json",
+                "bundle": true,
+                "platform": "node",
+                "format": ["esm"],
+                "generatePackageJson": true,
+                "assets": [],
+                "esbuildOptions": {
+                    "banner": {
+                        "js": "#!/usr/bin/env node"
+                    }
+                }
+            }
+        }
+    }
+}

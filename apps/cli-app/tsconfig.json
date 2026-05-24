@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "types": ["node"],
+    "paths": {
+      "@agent/core": ["packages/core/index.d.ts"],
+      "@agent/cli": ["packages/cli/index.d.ts"],
+      "@agent/openai": ["packages/providers/openai/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx"]
+}

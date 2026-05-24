@@ -12,13 +12,14 @@
 - [5. Phase 3: @agent/openai](#5-phase-3-agentopenai)
 - [5.5. Phase 3.5: Core streaming mode](#55-phase-35-core-streaming-mode)
 - [6. Phase 4: @agent/cli](#6-phase-4-agentcli)
-- [7. Phase 5: @agent/browser](#7-phase-5-agentbrowser)
-- [8. Phase 6: @agent/rest](#8-phase-6-agentrest)
-- [9. Phase 7: Примеры (apps)](#9-phase-7-примеры-apps)
-- [10. Phase 8: Тестирование](#10-phase-8-тестирование)
-- [11. Phase 9: Release и публикация](#11-phase-9-release-и-публикация)
-- [12. Phase 10: Документация](#12-phase-10-документация)
-- [13. Чеклист готовности](#13-чеклист-готовности)
+- [7. Phase 5: apps/cli-app — CLI приложение (React + Ink)](#7-phase-5-appscli-app--cli-приложение-react--ink)
+- [8. Phase 6: @agent/browser](#8-phase-6-agentbrowser)
+- [9. Phase 7: @agent/rest](#9-phase-7-agentrest)
+- [10. Phase 8: Примеры (apps)](#10-phase-8-примеры-apps)
+- [11. Phase 9: Тестирование](#11-phase-9-тестирование)
+- [12. Phase 10: Release и публикация](#12-phase-10-release-и-публикация)
+- [13. Phase 11: Документация](#13-phase-11-документация)
+- [14. Чеклист готовности](#14-чеклист-готовности)
 
 ---
 
@@ -169,11 +170,14 @@ npx create-nx-workspace@latest agent-framework \
 
 cd agent-framework
 
-# Добавить плагин для JS/TS библиотек
-npm install -D @nx/js
+# Добавить плагин для JS/TS библиотек (версию брать из текущего nx)
+npm install -D @nx/js@$(node -e "process.stdout.write(require('./node_modules/nx/package.json').version)")
 
-# Добавить поддержку vitest
-npm install -D @nx/vite vitest @vitest/coverage-v8
+# Добавить esbuild плагин (нужен для apps/cli-app в Phase 5) — та же версия что nx
+npm install -D @nx/esbuild@$(node -e "process.stdout.write(require('./node_modules/nx/package.json').version)")
+
+# Добавить поддержку vitest — та же версия что nx
+npm install -D @nx/vite@$(node -e "process.stdout.write(require('./node_modules/nx/package.json').version)") vitest @vitest/coverage-v8
 ```
 
 ### 2.2. `package.json` (корневой)
@@ -198,13 +202,18 @@ npm install -D @nx/vite vitest @vitest/coverage-v8
     "release:publish": "nx release publish"
   },
   "devDependencies": {
-    "@nx/js": "^20.0.0",
-    "@nx/vite": "^20.0.0",
-    "@nx/eslint": "^20.0.0",
+    "@nx/js": "22.7.2",
+    "@nx/esbuild": "22.7.2",
+    "@nx/vite": "22.7.2",
+    "@swc-node/register": "1.11.1",
+    "@swc/core": "1.15.8",
+    "@swc/helpers": "0.5.18",
     "@vitest/coverage-v8": "^2.0.0",
     "@types/node": "^22.0.0",
-    "nx": "^20.0.0",
-    "typescript": "^5.5.0",
+    "nx": "22.7.2",
+    "prettier": "^3.8.1",
+    "tslib": "^2.3.0",
+    "typescript": "~5.9.2",
     "vitest": "^2.0.0"
   },
   "packageManager": "npm@10.9.0"
@@ -246,7 +255,7 @@ npm install -D @nx/vite vitest @vitest/coverage-v8
     }
   },
   "release": {
-    "projects": ["packages/*", "packages/providers/*"],
+    "projects": ["packages/*", "packages/providers/*", "apps/cli-app"],
     "projectsRelationship": "independent",
     "version": {
       "conventionalCommits": true,
@@ -2158,9 +2167,453 @@ export { createCliAgent, runWithApproval } from './agent'
 
 ---
 
-## 7. Phase 5: @agent/browser
+## 7. Phase 5: apps/cli-app — CLI приложение (React + Ink)
 
-### 7.1. Генерация
+Полноценное интерактивное CLI, аналог Claude Code / Codex CLI. Устанавливается глобально, даёт команду `agent`.
+
+> **Архитектурные правила**
+> - Размещение: `apps/cli-app/` (НЕ в `packages/`)
+> - `projectType: "application"` в `project.json`
+> - Публикуется на npm как `@agent/cli-app` (бинарник `agent`)
+> - Не импортируется другими пакетами
+> - Нет path alias в `tsconfig.base.json`
+> - Вместо `runWithApproval()` (readline) — `agent.execute()` + Ink modal
+
+### 7.1. Структура
+
+```
+apps/cli-app/
+├── src/
+│   ├── cli.tsx                 ← entry: Commander.js + render(<App />)
+│   ├── app.tsx                 ← root Ink component, Agent wiring
+│   ├── store.ts                ← Zustand store
+│   ├── components/
+│   │   ├── ChatHistory.tsx     ← список сообщений
+│   │   ├── InputBox.tsx        ← ввод (ink-text-input)
+│   │   ├── StatusBar.tsx       ← модель, шаг, токены
+│   │   ├── ApprovalModal.tsx   ← y/n при approval.requested
+│   │   └── StreamingText.tsx   ← реал-тайм text.delta
+│   └── hooks/
+│       └── useAgent.ts         ← agent.execute() → Zustand store
+├── project.json
+├── package.json
+└── tsconfig.json
+```
+
+### 7.2. Генерация
+
+```bash
+# Убедиться, что @nx/esbuild установлен той же версии, что и nx (избегаем смешивания major)
+npm install -D @nx/esbuild@$(node -e "process.stdout.write(require('./node_modules/nx/package.json').version)")
+
+nx g @nx/js:application cli-app \
+  --directory=apps/cli-app \
+  --bundler=esbuild \
+  --projectNameAndRootFormat=as-provided \
+  --unitTestRunner=none
+```
+
+### 7.3. `apps/cli-app/package.json`
+
+```json
+{
+  "name": "@agent/cli-app",
+  "version": "0.1.0",
+  "description": "Interactive AI agent CLI",
+  "type": "module",
+  "bin": { "agent": "./cli.js" },
+  "main": "./cli.js",
+  "exports": { ".": "./cli.js" },
+  "publishConfig": { "access": "public" },
+  "dependencies": {
+    "@agent/core": "^0.1.0",
+    "@agent/cli": "^0.1.0",
+    "@agent/openai": "^0.1.0",
+    "react": "^18.3.0",
+    "ink": "^5.0.0",
+    "ink-text-input": "^6.0.0",
+    "zustand": "^4.5.0",
+    "commander": "^12.0.0"
+  }
+}
+```
+
+> `"type": "module"` обязателен для Ink (ESM-only). Пути в `bin`/`main`/`exports` — относительно `dist/apps/cli-app/`, поскольку `nx release publish` публикует именно оттуда. `"files"` не нужен — публикуем напрямую из dist.
+
+### 7.4. `apps/cli-app/project.json`
+
+```json
+{
+  "name": "@agent/cli-app",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "apps/cli-app/src",
+  "projectType": "application",
+  "tags": ["scope:app", "type:app"],
+  "implicitDependencies": ["@agent/core", "@agent/cli", "@agent/openai"],
+  "targets": {
+    "build": {
+      "executor": "@nx/esbuild:esbuild",
+      "outputs": ["{options.outputPath}"],
+      "options": {
+        "outputPath": "dist/apps/cli-app",
+        "main": "apps/cli-app/src/cli.tsx",
+        "tsConfig": "apps/cli-app/tsconfig.json",
+        "bundle": true,
+        "platform": "node",
+        "format": ["esm"],
+        "generatePackageJson": true,
+        "banner": { "js": "#!/usr/bin/env node" }
+      },
+      "dependsOn": ["^build"]
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx tsc --noEmit -p apps/cli-app/tsconfig.json"
+      }
+    },
+    "nx-release-publish": {
+      "options": {
+        "packageRoot": "dist/apps/cli-app"
+      }
+    }
+  }
+}
+```
+
+> `"format": ["esm"]` обязателен — Ink ESM-only.  
+> `"generatePackageJson": true` — esbuild копирует `package.json` (с зависимостями) в `outputPath`; без этого `npm publish` упадёт.  
+> `"nx-release-publish".packageRoot` — говорит `nx release publish`, где искать `package.json` для публикации.  
+> `"banner"` добавляет shebang в бандл — файл становится исполняемым напрямую.
+
+### 7.5. `apps/cli-app/src/store.ts`
+
+```typescript
+import { create } from 'zustand'
+import type { PauseReason } from '@agent/core'
+
+export type AppStatus = 'idle' | 'running' | 'streaming' | 'paused' | 'error'
+
+export interface DisplayMessage {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+}
+
+interface AgentStore {
+  status: AppStatus
+  messages: DisplayMessage[]
+  streamingText: string      // накапливает text.delta
+  pauseReason: PauseReason | null
+  pendingRunId: string | null
+  totalTokens: number
+  currentStep: number
+
+  setStatus: (s: AppStatus) => void
+  addMessage: (msg: DisplayMessage) => void
+  appendStreamingDelta: (delta: string) => void
+  commitStreamingText: () => void
+  setPause: (reason: PauseReason, runId: string) => void
+  clearPause: () => void
+  addTokens: (n: number) => void
+  setStep: (n: number) => void
+}
+
+export const useAgentStore = create<AgentStore>((set) => ({
+  status: 'idle',
+  messages: [],
+  streamingText: '',
+  pauseReason: null,
+  pendingRunId: null,
+  totalTokens: 0,
+  currentStep: 0,
+
+  setStatus: (status) => set({ status }),
+  addMessage: (msg) => set((s) => ({ messages: [...s.messages, msg] })),
+  appendStreamingDelta: (delta) =>
+    set((s) => ({ streamingText: s.streamingText + delta, status: 'streaming' })),
+  commitStreamingText: () =>
+    set((s) => ({
+      messages: s.streamingText
+        ? [...s.messages, { id: crypto.randomUUID(), role: 'assistant', text: s.streamingText }]
+        : s.messages,
+      streamingText: '',
+      status: 'idle',
+    })),
+  setPause: (pauseReason, pendingRunId) => set({ pauseReason, pendingRunId, status: 'paused' }),
+  clearPause: () => set({ pauseReason: null, pendingRunId: null }),
+  addTokens: (n) => set((s) => ({ totalTokens: s.totalTokens + n })),
+  setStep: (n) => set({ currentStep: n }),
+}))
+```
+
+### 7.6. `apps/cli-app/src/hooks/useAgent.ts`
+
+```typescript
+import { useCallback, useRef } from 'react'
+import type { Agent } from '@agent/core'
+import type { CliContext } from '@agent/cli'
+import { useAgentStore } from '../store.js'
+
+// context and stream come from App — never from agent internals
+export function useAgent(agent: Agent<CliContext>, context: CliContext, stream?: boolean) {
+  const store = useAgentStore
+  const agentRef = useRef(agent)
+  agentRef.current = agent
+
+  const run = useCallback(async (prompt: string) => {
+    const { setStatus, addMessage, appendStreamingDelta, commitStreamingText, setPause, addTokens, setStep } =
+      store.getState()
+
+    setStatus('running')
+    addMessage({ id: crypto.randomUUID(), role: 'user', text: prompt })
+
+    for await (const event of agentRef.current.execute(prompt, { context, stream })) {
+      switch (event.type) {
+        case 'text.delta':       appendStreamingDelta(event.text); break
+        // Non-streaming: event.text has the full text; streaming: streamingText already accumulated
+        case 'text.completed':   stream ? commitStreamingText() : addMessage({ id: crypto.randomUUID(), role: 'assistant', text: event.text }); break
+        case 'step.started':     setStep(event.stepNumber); break
+        case 'run.completed':    addTokens(event.output.usage.totalTokens); setStatus('idle'); break
+        case 'approval.requested':
+          setPause(
+            { type: 'approval_required', approvalId: event.approvalId, toolCallId: event.toolCallId,
+              toolName: event.toolName, input: event.input, message: event.message },
+            event.runId,
+          )
+          return  // suspend — resume() will continue
+        case 'run.failed':
+        case 'run.cancelled':    setStatus('error'); break
+      }
+    }
+  }, [context, stream])
+
+  const resume = useCallback(async (approvalId: string, runId: string, decision: 'allow' | 'deny') => {
+    const { clearPause, setStatus, addMessage, appendStreamingDelta, commitStreamingText, setPause, addTokens } =
+      store.getState()
+
+    clearPause()
+    setStatus('running')
+
+    for await (const event of agentRef.current.resume(runId, { approvalId, decision }, { context, stream })) {
+      switch (event.type) {
+        case 'text.delta':       appendStreamingDelta(event.text); break
+        case 'text.completed':   stream ? commitStreamingText() : addMessage({ id: crypto.randomUUID(), role: 'assistant', text: event.text }); break
+        case 'run.completed':    addTokens(event.output.usage.totalTokens); setStatus('idle'); break
+        case 'approval.requested':
+          setPause(
+            { type: 'approval_required', approvalId: event.approvalId, toolCallId: event.toolCallId,
+              toolName: event.toolName, input: event.input, message: event.message },
+            event.runId,
+          )
+          return
+        case 'run.failed':
+        case 'run.cancelled':    setStatus('error'); break
+      }
+    }
+  }, [context, stream])
+
+  return { run, resume }
+}
+```
+
+### 7.7. `apps/cli-app/src/components/ApprovalModal.tsx`
+
+```typescript
+import React from 'react'
+import { Box, Text, useInput } from 'ink'
+import { useAgentStore } from '../store.js'
+
+interface Props {
+  onDecision: (decision: 'allow' | 'deny') => void
+}
+
+export function ApprovalModal({ onDecision }: Props) {
+  const { pauseReason } = useAgentStore()
+  if (!pauseReason) return null
+
+  useInput((ch, key) => {
+    const keyChar = ch?.toLowerCase() ?? ''
+    if (keyChar === 'y') onDecision('allow')
+    if (keyChar === 'n' || key.escape) onDecision('deny')
+    // Enter intentionally does nothing — accidental Enter must not approve a tool call
+  })
+
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor="yellow" padding={1}>
+      <Text bold color="yellow">⚠ Approval required</Text>
+      <Text>Tool: <Text bold>{pauseReason.toolName}</Text></Text>
+      {pauseReason.message && <Text dimColor>{pauseReason.message}</Text>}
+      <Text>Input: {JSON.stringify(pauseReason.input, null, 2)}</Text>
+      <Text> </Text>
+      <Text><Text color="green">[y]</Text> Allow   <Text color="red">[n]</Text> Deny</Text>
+    </Box>
+  )
+}
+```
+
+### 7.8. `apps/cli-app/src/components/StatusBar.tsx`
+
+```typescript
+import React from 'react'
+import { Box, Text } from 'ink'
+import { useAgentStore } from '../store.js'
+
+export function StatusBar({ model }: { model: string }) {
+  const { status, currentStep, totalTokens } = useAgentStore()
+  const color = status === 'running' || status === 'streaming' ? 'green'
+    : status === 'paused' ? 'yellow'
+    : status === 'error'  ? 'red'
+    : 'gray'
+  return (
+    <Box justifyContent="space-between" borderStyle="single" borderColor="gray">
+      <Text dimColor>{model}</Text>
+      <Text color={color}>{status}</Text>
+      <Text dimColor>step {currentStep} · {totalTokens} tok</Text>
+    </Box>
+  )
+}
+```
+
+### 7.9. `apps/cli-app/src/app.tsx`
+
+```typescript
+import os from 'node:os'
+import path from 'node:path'
+import React, { useState, useCallback } from 'react'
+import { Box, Text } from 'ink'
+import TextInput from 'ink-text-input'
+import { Agent } from '@agent/core'
+import { createCliContext, FsMemoryStore, FsCheckpointStore } from '@agent/cli'
+import { createOpenAI } from '@agent/openai'
+import { useAgentStore } from './store.js'
+import { ApprovalModal } from './components/ApprovalModal.js'
+import { StatusBar } from './components/StatusBar.js'
+import { useAgent } from './hooks/useAgent.js'
+
+interface Props { model: string; stream?: boolean; apiKey?: string }
+
+export function App({ model, stream, apiKey }: Props) {
+  const { messages, streamingText, status, pauseReason, pendingRunId } = useAgentStore()
+  const [input, setInput] = useState('')
+
+  const context = React.useMemo(() => createCliContext(), [])
+
+  const agent = React.useMemo(() => new Agent({
+    name: 'cli-agent',
+    engine: createOpenAI({ apiKey: apiKey ?? process.env.OPENAI_API_KEY! }).engine(model),
+    tools: [],  // ← пользователь добавляет свои инструменты здесь
+    memory: new FsMemoryStore(path.join(os.homedir(), '.agent', 'memory')),
+    checkpoints: new FsCheckpointStore(path.join(os.homedir(), '.agent', 'checkpoints')),
+    system: 'You are a helpful assistant.',
+  }), [model, apiKey])
+
+  const { run, resume } = useAgent(agent, context, stream)
+
+  const handleSubmit = useCallback((val: string) => {
+    if (!val.trim()) return
+    setInput('')
+    run(val.trim())
+  }, [run])
+
+  const handleApproval = useCallback((decision: 'allow' | 'deny') => {
+    if (!pauseReason || !pendingRunId) return
+    resume(pauseReason.approvalId, pendingRunId, decision)
+  }, [pauseReason, pendingRunId, resume])
+
+  return (
+    <Box flexDirection="column" height="100%">
+      <StatusBar model={model} />
+      <Box flexDirection="column" flexGrow={1}>
+        {messages.map((msg) => (
+          <Box key={msg.id} marginBottom={1}>
+            <Text bold color={msg.role === 'user' ? 'cyan' : 'white'}>
+              {msg.role === 'user' ? 'you: ' : 'agent: '}
+            </Text>
+            <Text>{msg.text}</Text>
+          </Box>
+        ))}
+        {streamingText && (
+          <Box>
+            <Text bold color="white">agent: </Text>
+            <Text>{streamingText}</Text>
+            <Text color="green">▋</Text>
+          </Box>
+        )}
+      </Box>
+      {status === 'paused' ? (
+        <ApprovalModal onDecision={handleApproval} />
+      ) : (
+        <Box borderStyle="single" borderColor="gray">
+          <Text color="cyan">{'> '}</Text>
+          <TextInput value={input} onChange={setInput} onSubmit={handleSubmit} placeholder="Type a message..." />
+        </Box>
+      )}
+    </Box>
+  )
+}
+```
+
+### 7.10. `apps/cli-app/src/cli.tsx`
+
+```typescript
+#!/usr/bin/env node
+import React from 'react'
+import { render } from 'ink'
+import { program } from 'commander'
+import { App } from './app.js'
+
+program
+  .name('agent')
+  .description('Interactive AI agent CLI')
+  .version('0.1.0')
+  .option('-m, --model <model>', 'OpenAI model', 'gpt-4o')
+  .option('-k, --api-key <key>', 'OpenAI API key (default: $OPENAI_API_KEY)')
+  .option('--stream', 'Enable streaming output', false)
+  .action((opts) => {
+    render(
+      <App model={opts.model} stream={opts.stream} apiKey={opts.apiKey} />,
+      { exitOnCtrlC: true },
+    )
+  })
+
+program.parse()
+```
+
+### 7.11. Обновление `nx.json` — `release.projects`
+
+```json
+"projects": ["packages/*", "packages/providers/*", "apps/cli-app"]
+```
+
+### 7.12. Запуск и публикация
+
+```bash
+# Сборка (включает зависимые пакеты благодаря dependsOn: ["^build"])
+npm exec nx build @agent/cli-app
+
+# Запуск из dist (рекомендуется — использует собранные зависимости)
+node dist/apps/cli-app/cli.js --model gpt-4o --stream
+
+# Локальный запуск через tsx — ТОЛЬКО после сборки зависимостей:
+#   npm exec nx run-many -t build --projects=@agent/core,@agent/cli,@agent/openai
+# Иначе @agent/core/@agent/cli/@agent/openai не разрешатся (нет dist/)
+npx tsx apps/cli-app/src/cli.tsx --model gpt-4o --stream
+
+# Глобальная установка из dist (для тестирования)
+npm install -g ./dist/apps/cli-app
+
+# После публикации на npm
+npm install -g @agent/cli-app
+agent --model gpt-4o --stream
+agent --model gpt-4o-mini
+```
+
+---
+
+## 8. Phase 6: @agent/browser
+
+### 8.1. Генерация
 
 ```bash
 nx g @nx/js:library browser \
@@ -2172,7 +2625,7 @@ nx g @nx/js:library browser \
   --projectNameAndRootFormat=as-provided
 ```
 
-### 7.2. `packages/browser/package.json`
+### 8.2. `packages/browser/package.json`
 
 ```json
 {
@@ -2198,7 +2651,7 @@ nx g @nx/js:library browser \
 }
 ```
 
-### 7.3. `packages/browser/tsconfig.lib.json`
+### 8.3. `packages/browser/tsconfig.lib.json`
 
 ```json
 {
@@ -2215,7 +2668,7 @@ nx g @nx/js:library browser \
 }
 ```
 
-### 7.4. `packages/browser/project.json`
+### 8.4. `packages/browser/project.json`
 
 ```json
 {
@@ -2244,7 +2697,7 @@ nx g @nx/js:library browser \
 }
 ```
 
-### 7.5. Исходные файлы
+### 8.5. Исходные файлы
 
 **`packages/browser/src/context.ts`**
 
@@ -2362,9 +2815,9 @@ export { createBrowserAgent, runWithApproval } from './agent'
 
 ---
 
-## 8. Phase 6: @agent/rest
+## 9. Phase 7: @agent/rest
 
-### 8.1. Генерация
+### 9.1. Генерация
 
 ```bash
 nx g @nx/js:library rest \
@@ -2376,7 +2829,7 @@ nx g @nx/js:library rest \
   --projectNameAndRootFormat=as-provided
 ```
 
-### 8.2. `packages/rest/package.json`
+### 9.2. `packages/rest/package.json`
 
 ```json
 {
@@ -2410,7 +2863,7 @@ nx g @nx/js:library rest \
 }
 ```
 
-### 8.3. `packages/rest/project.json`
+### 9.3. `packages/rest/project.json`
 
 ```json
 {
@@ -2439,7 +2892,7 @@ nx g @nx/js:library rest \
 }
 ```
 
-### 8.4. Исходные файлы
+### 9.4. Исходные файлы
 
 **`packages/rest/src/context.ts`**
 
@@ -2614,9 +3067,9 @@ export { router }
 
 ---
 
-## 9. Phase 7: Примеры (apps)
+## 10. Phase 8: Примеры (apps)
 
-### 9.1. `apps/examples/cli-devops/project.json`
+### 10.1. `apps/examples/cli-devops/project.json`
 
 ```json
 {
@@ -2639,7 +3092,7 @@ export { router }
 }
 ```
 
-### 9.2. `apps/examples/cli-devops/src/main.ts`
+### 10.2. `apps/examples/cli-devops/src/main.ts`
 
 ```typescript
 import * as path from 'path'
@@ -2719,9 +3172,9 @@ main().catch(console.error)
 
 ---
 
-## 10. Phase 8: Тестирование
+## 11. Phase 9: Тестирование
 
-### 10.1. `packages/core/test/utils/mock-engine.ts`
+### 11.1. `packages/core/test/utils/mock-engine.ts`
 
 ```typescript
 import type { IEngine, EngineCallOptions, EngineResponse, EngineStreamChunk } from '../../src'
@@ -2763,7 +3216,7 @@ export class MockEngine implements IEngine {
 }
 ```
 
-### 10.2. `packages/core/test/agent.test.ts`
+### 11.2. `packages/core/test/agent.test.ts`
 
 ```typescript
 import { describe, it, expect, beforeEach } from 'vitest'
@@ -3256,7 +3709,7 @@ describe('Agent', () => {
 })
 ```
 
-### 10.3. `packages/core/test/build-tool.test.ts`
+### 11.3. `packages/core/test/build-tool.test.ts`
 
 ```typescript
 import { describe, it, expect } from 'vitest'
@@ -3308,7 +3761,7 @@ describe('buildTool', () => {
   })
 })
 
-### 10.3. Запуск тестов
+### 11.3. Запуск тестов
 
 ```bash
 # Только core
@@ -3326,11 +3779,11 @@ nx affected -t test
 
 ---
 
-## 11. Phase 9: Release и публикация
+## 12. Phase 10: Release и публикация
 
 **Цель:** Настроить автоматическое версионирование и публикацию через `nx release`.
 
-### 11.1. Принцип работы `nx release`
+### 12.1. Принцип работы `nx release`
 
 ```
 git commit  →  nx release version  →  nx release changelog  →  nx release publish
@@ -3340,7 +3793,7 @@ git commit  →  nx release version  →  nx release changelog  →  nx release 
 - `nx release changelog` — генерирует `CHANGELOG.md` для каждого пакета и создаёт GitHub Release
 - `nx release publish` — запускает `npm publish` для `dist/packages/**` (включая `dist/packages/providers/*`)
 
-### 11.2. Конфигурация в `nx.json`
+### 12.2. Конфигурация в `nx.json`
 
 ```json
 {
@@ -3368,7 +3821,7 @@ git commit  →  nx release version  →  nx release changelog  →  nx release 
 }
 ```
 
-### 11.3. Сценарии релиза
+### 12.3. Сценарии релиза
 
 ```bash
 # Dry run — посмотреть что изменится
@@ -3387,7 +3840,7 @@ nx release publish
 nx release publish --dry-run
 ```
 
-### 11.4. `publishConfig` в каждом `package.json`
+### 12.4. `publishConfig` в каждом `package.json`
 
 Каждый пакет должен содержать:
 
@@ -3400,7 +3853,7 @@ nx release publish --dry-run
 }
 ```
 
-### 11.5. `.npmrc` в корне (опционально)
+### 12.5. `.npmrc` в корне (опционально)
 
 ```ini
 # Автоматически используется при публикации
@@ -3408,7 +3861,7 @@ registry=https://registry.npmjs.org
 access=public
 ```
 
-### 11.6. Conventional Commits — примеры
+### 12.6. Conventional Commits — примеры
 
 ```
 feat(core): add streaming support to Agent          → minor bump
@@ -3419,13 +3872,13 @@ chore: update dependencies                          → no bump
 
 ---
 
-## 12. Phase 10: Документация
+## 13. Phase 11: Документация
 
 Идентична предыдущему плану (Phase 11), добавить секцию про `nx release`.
 
 ---
 
-## 13. Чеклист готовности
+## 14. Чеклист готовности
 
 ### Инфраструктура
 
@@ -3466,6 +3919,16 @@ chore: update dependencies                          → no bump
 - [ ] `createCliAgent` возвращает `Agent`
 - [ ] `runWithApproval` обрабатывает pause через readline в цикле
 
+### apps/cli-app
+
+- [ ] `nx build @agent/cli-app` собирает без ошибок в `dist/apps/cli-app/`
+- [ ] `dist/apps/cli-app/cli.js` содержит shebang (`#!/usr/bin/env node`)
+- [ ] `dist/apps/cli-app/package.json` содержит `"bin"`, `"type": "module"`, корректные `exports`
+- [ ] `node dist/apps/cli-app/cli.js --help` выводит usage без ошибок
+- [ ] `npm install -g ./dist/apps/cli-app` устанавливает команду `agent`
+- [ ] `nx-release-publish` target публикует из `dist/apps/cli-app`
+- [ ] Approval flow работает: `approval.requested` → ApprovalModal → `[y/n]` → `resume()`
+
 ### @agent/browser
 
 - [ ] `BrowserContext` с DOM API
@@ -3500,7 +3963,7 @@ chore: update dependencies                          → no bump
 ## Порядок выполнения
 
 ```
-Phase 0 -> Phase 1 -> Phase 2 -> Phase 3 -> Phase 3.5 -> Phase 4 -> Phase 5 -> Phase 6 -> Phase 7 -> Phase 8 -> Phase 9 -> Phase 10
+Phase 0 -> Phase 1 -> Phase 2 -> Phase 3 -> Phase 3.5 -> Phase 4 -> Phase 5 -> Phase 6 -> Phase 7 -> Phase 8 -> Phase 9 -> Phase 10 -> Phase 11
 ```
 
 ### Команды для проверки прогресса
