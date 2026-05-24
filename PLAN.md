@@ -10,6 +10,7 @@
 - [3. Phase 1: @agent/core — типы и контракты](#3-phase-1-agentcore--типы-и-контракты)
 - [4. Phase 2: @agent/core — Agent и buildTool](#4-phase-2-agentcore--agent-и-buildtool)
 - [5. Phase 3: @agent/openai](#5-phase-3-agentopenai)
+- [5.5. Phase 3.5: Core streaming mode](#55-phase-35-core-streaming-mode)
 - [6. Phase 4: @agent/cli](#6-phase-4-agentcli)
 - [7. Phase 5: @agent/browser](#7-phase-5-agentbrowser)
 - [8. Phase 6: @agent/rest](#8-phase-6-agentrest)
@@ -1799,6 +1800,35 @@ export { OpenAIProvider, createOpenAI } from './provider'
 
 ---
 
+## 5.5. Phase 3.5: Core streaming mode
+
+**Status:** Done.
+
+**Goal:** Add streaming execution to `@agent/core` without introducing runtime-specific abstractions.
+
+Implemented:
+
+- `RunOptions.stream?: boolean`
+- `ResumeOptions.stream?: boolean`
+- `Agent.execute()` remains the single primitive
+- `Agent.run()` remains a wrapper over `execute()`
+- Default behavior still uses `engine.call()`
+- `stream: true` consumes `engine.stream()`, emits `reasoning.delta` / `text.delta`, assembles the final `EngineResponse`, then reuses the existing tool/approval/pause/resume loop
+- `resume(..., { stream: true })` continues with streaming after approval
+- Abort during stream returns `run.cancelled`, non-abort stream errors become `run.failed`
+
+Verified:
+
+- `npx nx run @agent/core:test --skip-nx-cache` passes: 34/34
+- `npx nx run @agent/openai:test --skip-nx-cache` passes: 5/5
+- `npx nx run-many -t typecheck --projects @agent/core,@agent/openai --skip-nx-cache` passes
+- `npx nx run-many -t build --projects @agent/core,@agent/openai --skip-nx-cache` passes
+- Workspace and dist imports pass for `@agent/core` and `@agent/openai`
+
+Next phase: `@agent/cli`.
+
+---
+
 ## 6. Phase 4: @agent/cli
 
 ### 6.1. Генерация
@@ -3356,6 +3386,9 @@ chore: update dependencies                          → no bump
 
 ### @agent/core
 
+- [x] Phase 1-2 core MVP implemented and verified
+- [x] Phase 3.5 streaming mode implemented and verified
+
 - [ ] `project.json` настроен с `build`, `test`, `typecheck` targets
 - [ ] `package.json` с `publishConfig` и корректными `exports`
 - [ ] Все типы определены (`types/*`)
@@ -3367,6 +3400,8 @@ chore: update dependencies                          → no bump
 - [ ] Unit тесты проходят (`nx test @agent/core`)
 
 ### @agent/openai
+
+- [x] Phase 3 OpenAI provider MVP implemented and verified
 
 - [ ] `project.json` с `dependsOn: ["^build"]`
 - [ ] `OpenAIEngine` реализован
@@ -3415,7 +3450,7 @@ chore: update dependencies                          → no bump
 ## Порядок выполнения
 
 ```
-Phase 0 → Phase 1 → Phase 2 → Phase 3 → Phase 4 → Phase 5 → Phase 6 → Phase 7 → Phase 8 → Phase 9 → Phase 10
+Phase 0 -> Phase 1 -> Phase 2 -> Phase 3 -> Phase 3.5 -> Phase 4 -> Phase 5 -> Phase 6 -> Phase 7 -> Phase 8 -> Phase 9 -> Phase 10
 ```
 
 ### Команды для проверки прогресса
