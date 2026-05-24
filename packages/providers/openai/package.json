@@ -1,0 +1,22 @@
+{
+  "name": "@agent/openai",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@agent/core": "^0.1.0",
+    "openai": "^6.39.0",
+    "tslib": "^2.3.0"
+  },
+  "sideEffects": false
+}

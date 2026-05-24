@@ -1,0 +1,64 @@
+{
+  "name": "@agent/openai",
+  "$schema": "../../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "packages/providers/openai/src",
+  "projectType": "library",
+  "implicitDependencies": [
+    "@agent/core"
+  ],
+  "targets": {
+    "build": {
+      "executor": "@nx/js:tsc",
+      "outputs": [
+        "{options.outputPath}"
+      ],
+      "options": {
+        "outputPath": "dist/packages/providers/openai",
+        "main": "packages/providers/openai/src/index.ts",
+        "tsConfig": "packages/providers/openai/tsconfig.lib.json",
+        "rootDir": "packages/providers/openai/src",
+        "outputFileName": "index.js",
+        "packageJson": "packages/providers/openai/package.json",
+        "assets": [
+          "packages/providers/openai/*.md"
+        ],
+        "updateBuildableProjectDepsInPackageJson": true,
+        "buildableProjectDepsInPackageJsonType": "dependencies"
+      }
+    },
+    "typecheck": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "npx tsc --noEmit -p packages/providers/openai/tsconfig.json"
+      }
+    },
+    "test": {
+      "executor": "nx:run-commands",
+      "outputs": [
+        "{workspaceRoot}/coverage/packages/providers/openai"
+      ],
+      "options": {
+        "command": "npx vitest run",
+        "cwd": "packages/providers/openai"
+      }
+    },
+    "nx-release-publish": {
+      "options": {
+        "packageRoot": "dist/{projectRoot}"
+      }
+    }
+  },
+  "tags": [
+    "scope:provider",
+    "type:lib"
+  ],
+  "release": {
+    "version": {
+      "manifestRootsToUpdate": [
+        "dist/{projectRoot}"
+      ],
+      "currentVersionResolver": "git-tag",
+      "fallbackCurrentVersionResolver": "disk"
+    }
+  }
+}
