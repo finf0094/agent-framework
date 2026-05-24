@@ -1029,7 +1029,8 @@ import type { IAgent, AgentConfig } from '../types/agent'
 import type { AgentContext } from '../types/context'
 import type { Message, ToolCallPart, ToolResultPart } from '../types/message'
 import type { AgentEvent } from '../types/events'
-import type { TokenUsage, EngineResponse } from '../types/engine'
+import type { TokenUsage, EngineResponse, EngineCallOptions } from '../types/engine'
+import type { ToolCall } from '../types/tool'
 import type { RunCheckpoint } from '../types/checkpoint'
 import type {
   RunOptions, ResumeOptions, ResumeInput, RunResult, AgentStep, AgentOutput, PauseReason,
@@ -1111,7 +1112,7 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
       step: 0, startTime: Date.now(),
       usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
       steps: [],
-    })
+    }, options.stream)
   }
 
   private async *_resumeFromCheckpoint(
@@ -1178,7 +1179,54 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
       startTime: checkpoint.startedAt,
       usage: checkpoint.usage,
       steps: checkpoint.steps,
-    })
+    }, options.stream)
+  }
+
+  // Routes to engine.call() or engine.stream() based on stream flag.
+  // In streaming mode: emits reasoning.delta, text.delta, text.completed events inline.
+  // In non-streaming mode: returns a plain EngineResponse; caller emits events itself.
+  private async *_runEngineStep(
+    runId: string,
+    engineCallOptions: EngineCallOptions,
+    stream: boolean | undefined,
+  ): AsyncGenerator<AgentEvent, EngineResponse> {
+    if (!stream) {
+      return await this.config.engine.call(engineCallOptions)
+    }
+
+    let textAccum = ''
+    let reasoningAccum = ''
+    const toolCalls: ToolCall[] = []
+    let usage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 }
+
+    for await (const chunk of this.config.engine.stream(engineCallOptions)) {
+      if (chunk.type === 'reasoning-delta' && chunk.reasoningDelta) {
+        reasoningAccum += chunk.reasoningDelta
+        yield { type: 'reasoning.delta', runId, text: chunk.reasoningDelta }
+      }
+      if (chunk.type === 'text-delta' && chunk.textDelta) {
+        textAccum += chunk.textDelta
+        yield { type: 'text.delta', runId, text: chunk.textDelta }
+      }
+      if (chunk.type === 'tool-call' && chunk.toolCall?.id && chunk.toolCall?.name) {
+        toolCalls.push({ id: chunk.toolCall.id, name: chunk.toolCall.name, arguments: chunk.toolCall.arguments ?? {} })
+      }
+      if (chunk.type === 'finish' && chunk.usage) {
+        usage = chunk.usage
+      }
+    }
+
+    if (reasoningAccum) yield { type: 'reasoning.completed', runId, text: reasoningAccum }
+    if (textAccum)     yield { type: 'text.completed',      runId, text: textAccum }
+
+    return {
+      text: textAccum || undefined,
+      reasoning: reasoningAccum || undefined,
+      toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+      finishReason: toolCalls.length > 0 ? 'tool-calls' : 'stop',
+      usage,
+      raw: null,
+    }
   }
 
   private async *_loop(
@@ -1186,6 +1234,7 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
     threadId: string,
     options: ResumeOptions<Ctx>,
     state: LoopState,
+    stream?: boolean,
   ): AsyncGenerator<AgentEvent, RunResult> {
     const maxSteps = options.maxSteps ?? 10
     let { step, startTime, usage, steps } = state
@@ -1208,12 +1257,12 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
       const messages = await this.config.memory.list(threadId)
       let response: EngineResponse
       try {
-        response = await this.config.engine.call({
+        response = yield* this._runEngineStep(runId, {
           messages,
           tools: this.config.tools.map(t => t.toSchema()),
           system: this.config.system,
           abortSignal: options.abortSignal,
-        })
+        }, stream)
       } catch (err) {
         // AbortError mid-call: SDK threw when signal fired
         if (options.abortSignal?.aborted) {
@@ -1225,8 +1274,8 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
 
       usage = addUsage(usage, response.usage)
 
-      // reasoning.completed: full reasoning block from models that expose it
-      if (response.reasoning) {
+      // Non-streaming: emit reasoning.completed here; streaming already emitted deltas in _runEngineStep
+      if (!stream && response.reasoning) {
         yield { type: 'reasoning.completed', runId, text: response.reasoning }
       }
 
@@ -1234,7 +1283,8 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
       if (response.finishReason !== 'tool-calls' || !response.toolCalls?.length) {
         await this.config.memory.append(threadId, [{ role: 'assistant', content: response.text ?? '' }])
 
-        if (response.text) {
+        // Non-streaming: emit text.completed here; streaming already emitted in _runEngineStep
+        if (!stream && response.text) {
           yield { type: 'text.completed', runId, text: response.text }
         }
 
