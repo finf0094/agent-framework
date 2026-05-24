@@ -2,7 +2,8 @@ import type { IAgent, AgentConfig } from '../types/agent.js';
 import type { AgentContext } from '../types/context.js';
 import type { Message, ToolCallPart, ToolResultPart } from '../types/message.js';
 import type { AgentEvent } from '../types/events.js';
-import type { TokenUsage, EngineResponse } from '../types/engine.js';
+import type { TokenUsage, EngineResponse, EngineCallOptions } from '../types/engine.js';
+import type { ToolCall } from '../types/tool.js';
 import type { RunCheckpoint } from '../types/checkpoint.js';
 import type { RunOptions, ResumeOptions, ResumeInput, RunResult, AgentStep, AgentOutput, PauseReason } from '../types/run.js';
 import {
@@ -90,7 +91,7 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
             startTime: Date.now(),
             usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
             steps: []
-        });
+        }, options.stream);
     }
 
     private async *_resumeFromCheckpoint(
@@ -245,14 +246,66 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
             startTime: checkpoint.startedAt,
             usage: checkpoint.usage,
             steps: resumedSteps
-        });
+        }, options.stream);
+    }
+
+    private async *_runEngineStep(
+        runId: string,
+        engineCallOptions: EngineCallOptions,
+        stream: boolean | undefined
+    ): AsyncGenerator<AgentEvent, EngineResponse> {
+        if (!stream) {
+            return await this.config.engine.call(engineCallOptions);
+        }
+
+        let textAccum = '';
+        let reasoningAccum = '';
+        const toolCalls: ToolCall[] = [];
+        let usage: TokenUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
+
+        for await (const chunk of this.config.engine.stream(engineCallOptions)) {
+            if (chunk.type === 'reasoning-delta' && chunk.reasoningDelta) {
+                reasoningAccum += chunk.reasoningDelta;
+                yield { type: 'reasoning.delta', runId, text: chunk.reasoningDelta };
+            }
+            if (chunk.type === 'text-delta' && chunk.textDelta) {
+                textAccum += chunk.textDelta;
+                yield { type: 'text.delta', runId, text: chunk.textDelta };
+            }
+            if (chunk.type === 'tool-call') {
+                const tc = chunk.toolCall;
+                if (tc?.id && tc?.name) {
+                    toolCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments ?? {} });
+                }
+            }
+            if (chunk.type === 'finish' && chunk.usage) {
+                usage = chunk.usage;
+            }
+        }
+
+        if (reasoningAccum) {
+            yield { type: 'reasoning.completed', runId, text: reasoningAccum };
+        }
+        if (textAccum) {
+            yield { type: 'text.completed', runId, text: textAccum };
+        }
+
+        return {
+            text: textAccum || undefined,
+            reasoning: reasoningAccum || undefined,
+            toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+            finishReason: toolCalls.length > 0 ? 'tool-calls' : 'stop',
+            usage,
+            raw: null
+        };
     }
 
     private async *_loop(
         runId: string,
         threadId: string,
         options: ResumeOptions<Ctx>,
-        state: LoopState
+        state: LoopState,
+        stream?: boolean
     ): AsyncGenerator<AgentEvent, RunResult> {
         const maxSteps = options.maxSteps ?? 10;
         let { step, startTime, usage, steps } = state;
@@ -279,12 +332,12 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
                 const messages = await this.config.memory.list(threadId);
                 let response: EngineResponse;
                 try {
-                    response = await this.config.engine.call({
+                    response = yield* this._runEngineStep(runId, {
                         messages,
                         tools: this.config.tools.map((t) => t.toSchema()),
                         system: this.config.system,
                         abortSignal: options.abortSignal
-                    });
+                    }, stream);
                 } catch (err) {
                     if (options.abortSignal?.aborted) {
                         yield { type: 'run.cancelled', runId, reason: 'Aborted' };
@@ -301,7 +354,7 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
 
                 usage = addUsage(usage, response.usage);
 
-                if (response.reasoning) {
+                if (!stream && response.reasoning) {
                     yield {
                         type: 'reasoning.completed',
                         runId,
@@ -312,7 +365,7 @@ export class Agent<Ctx extends AgentContext = AgentContext> implements IAgent<Ct
                 if (response.finishReason !== 'tool-calls' || !response.toolCalls?.length) {
                     await this.config.memory.append(threadId, [{ role: 'assistant', content: response.text ?? '' }]);
 
-                    if (response.text) {
+                    if (!stream && response.text) {
                         yield { type: 'text.completed', runId, text: response.text };
                     }
 

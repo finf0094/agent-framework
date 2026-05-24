@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { z } from 'zod'
 import { Agent } from '../src/agent/agent'
 import { InMemoryStore } from '../src/memory/in-memory'
@@ -562,6 +562,184 @@ describe('Agent', () => {
     const toolResults = messages.filter(m => m.role === 'tool')
     expect(toolResults).toHaveLength(1)
     expect(toolResults[0].toolCallId).toBe('c1')
+  })
+
+  it('stream: false (default) uses engine.call(), not engine.stream()', async () => {
+    engine.queueResponse({ text: 'Hello!', finishReason: 'stop' })
+    const callSpy = vi.spyOn(engine, 'call')
+    const streamSpy = vi.spyOn(engine, 'stream')
+    const agent = new Agent<Ctx>({ name: 'test', engine, tools: [], memory })
+    await agent.run('Hi', { context: {} })
+    expect(callSpy).toHaveBeenCalledOnce()
+    expect(streamSpy).not.toHaveBeenCalled()
+  })
+
+  it('stream: true emits text.delta events and assembles output.text', async () => {
+    engine.queueStreamChunks([
+      { type: 'text-delta', textDelta: 'Hello' },
+      { type: 'text-delta', textDelta: ' World' },
+      { type: 'finish', usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+    ])
+    const agent = new Agent<Ctx>({ name: 'test', engine, tools: [], memory })
+    const events: Array<{ type: string; text?: string }> = []
+    const result = await agent.run('Hi', {
+      context: {},
+      stream: true,
+      onEvent: e => events.push(e as any),
+    })
+    expect(result.status).toBe('completed')
+    expect(result.output?.text).toBe('Hello World')
+    const deltas = events.filter(e => e.type === 'text.delta').map(e => e.text)
+    expect(deltas).toEqual(['Hello', ' World'])
+    const completed = events.find(e => e.type === 'text.completed')
+    expect(completed?.text).toBe('Hello World')
+  })
+
+  it('stream: true emits reasoning.delta and reasoning.completed', async () => {
+    engine.queueStreamChunks([
+      { type: 'reasoning-delta', reasoningDelta: 'Let me' },
+      { type: 'reasoning-delta', reasoningDelta: ' think' },
+      { type: 'text-delta', textDelta: 'Answer' },
+      { type: 'finish', usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+    ])
+    const agent = new Agent<Ctx>({ name: 'test', engine, tools: [], memory })
+    const events: Array<{ type: string; text?: string }> = []
+    await agent.run('Hi', {
+      context: {},
+      stream: true,
+      onEvent: e => events.push(e as any),
+    })
+    const reasoningDeltas = events.filter(e => e.type === 'reasoning.delta').map(e => e.text)
+    expect(reasoningDeltas).toEqual(['Let me', ' think'])
+    const reasoningCompleted = events.find(e => e.type === 'reasoning.completed')
+    expect(reasoningCompleted?.text).toBe('Let me think')
+    const reasoningIdx = events.findIndex(e => e.type === 'reasoning.completed')
+    const textCompletedIdx = events.findIndex(e => e.type === 'text.completed')
+    expect(reasoningIdx).toBeLessThan(textCompletedIdx)
+  })
+
+  it('stream: true with tool-call chunk executes tool and completes', async () => {
+    engine.queueStreamChunks([
+      { type: 'tool-call', toolCallIndex: 0, toolCall: { id: 'c1', name: 'echo', arguments: { msg: 'hi' } } },
+      { type: 'finish', usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+    ])
+    engine.queueStreamChunks([
+      { type: 'text-delta', textDelta: 'Done' },
+      { type: 'finish', usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+    ])
+
+    const echo = buildTool({
+      name: 'echo',
+      description: 'Echo',
+      inputSchema: z.object({ msg: z.string() }),
+      async execute({ msg }) { return msg },
+    })
+
+    const agent = new Agent<Ctx>({ name: 'test', engine, tools: [echo], memory })
+    const events: string[] = []
+    const result = await agent.run('Test', {
+      context: {},
+      stream: true,
+      onEvent: e => events.push(e.type),
+    })
+
+    expect(result.status).toBe('completed')
+    expect(result.output?.text).toBe('Done')
+    expect(events).toContain('tool.started')
+    expect(events).toContain('tool.finished')
+  })
+
+  it('abort during stream emits run.cancelled, not run.failed', async () => {
+    const controller = new AbortController()
+    const abortStreamEngine = {
+      provider: 'mock' as const,
+      modelId: 'abort-stream',
+      async call() { throw new Error('should not be called') },
+      async *stream() {
+        controller.abort()
+        throw new DOMException('Aborted', 'AbortError')
+      },
+    }
+    const agent = new Agent<Ctx>({ name: 'test', engine: abortStreamEngine, tools: [], memory })
+    const events: string[] = []
+
+    const result = await agent.run('Hi', {
+      context: {},
+      stream: true,
+      abortSignal: controller.signal,
+      onEvent: e => events.push(e.type),
+    })
+
+    expect(result.status).toBe('cancelled')
+    expect(result.error).toBe('Aborted')
+    expect(events).toContain('run.cancelled')
+    expect(events).not.toContain('run.failed')
+  })
+
+  it('stream error emits run.failed, not run.cancelled', async () => {
+    const failStreamEngine = {
+      provider: 'mock' as const,
+      modelId: 'fail-stream',
+      async call() { throw new Error('should not be called') },
+      async *stream() {
+        throw new Error('Stream network error')
+      },
+    }
+    const agent = new Agent<Ctx>({ name: 'test', engine: failStreamEngine, tools: [], memory })
+    const events: string[] = []
+
+    const result = await agent.run('Hi', {
+      context: {},
+      stream: true,
+      onEvent: e => events.push(e.type),
+    })
+
+    expect(result.status).toBe('failed')
+    expect(result.error).toBe('Stream network error')
+    expect(events).toContain('run.failed')
+    expect(events).not.toContain('run.cancelled')
+  })
+
+  it('resume with stream: true emits text.delta after approval', async () => {
+    // First run: stream mode, tool needs approval → paused
+    engine.queueStreamChunks([
+      { type: 'tool-call', toolCallIndex: 0, toolCall: { id: 'c1', name: 'risky', arguments: { cmd: 'x' } } },
+      { type: 'finish', usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+    ])
+    // Second run (after resume): stream mode, final text response
+    engine.queueStreamChunks([
+      { type: 'text-delta', textDelta: 'All' },
+      { type: 'text-delta', textDelta: ' done' },
+      { type: 'finish', usage: { promptTokens: 1, completionTokens: 2, totalTokens: 3 } },
+    ])
+
+    const risky = buildTool({
+      name: 'risky',
+      description: 'Risky',
+      inputSchema: z.object({ cmd: z.string() }),
+      needsApproval: () => ({ behavior: 'pause' }),
+      async execute({ cmd }) { return `ran: ${cmd}` },
+    })
+
+    const agent = new Agent<Ctx>({ name: 'test', engine, tools: [risky], memory, checkpoints })
+    const paused = await agent.run('Run risky', { context: {}, stream: true })
+    expect(paused.status).toBe('paused')
+
+    const resumeEvents: Array<{ type: string; text?: string }> = []
+    const resumed = await agent.resume(paused.runId, {
+      approvalId: paused.pauseReason!.approvalId,
+      decision: 'allow',
+    }, {
+      context: {},
+      stream: true,
+      onEvent: e => resumeEvents.push(e as any),
+    })
+
+    expect(resumed.status).toBe('completed')
+    expect(resumed.output?.text).toBe('All done')
+    const deltas = resumeEvents.filter(e => e.type === 'text.delta').map(e => e.text)
+    expect(deltas).toEqual(['All', ' done'])
+    expect(resumeEvents.find(e => e.type === 'text.completed')?.text).toBe('All done')
   })
 
   it('emits run.failed and returns failed status when maxSteps exceeded', async () => {

@@ -49,6 +49,7 @@ export interface RunOptions<Ctx> {
     maxSteps?: number;
     abortSignal?: AbortSignal;
     onEvent?: (event: AgentEvent) => void;
+    stream?: boolean;
 }
 
 export interface ResumeInput {
@@ -62,4 +63,5 @@ export interface ResumeOptions<Ctx> {
     maxSteps?: number;
     abortSignal?: AbortSignal;
     onEvent?: (event: AgentEvent) => void;
+    stream?: boolean;
 }
