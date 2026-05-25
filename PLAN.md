@@ -4271,7 +4271,7 @@ function StatusBar({ model, cwd, session, stream, isRunning, step, totalTokens }
 **`ChatHistory.tsx`** — support `UiMessage` kinds:
 
 ```typescript
-import type { UiMessage } from '../store/types.js'
+import type { UiMessage } from '../store.js'
 
 function kindColor(kind: UiMessage['kind']): string {
     switch (kind) {
@@ -4551,10 +4551,12 @@ describe('command registry', () => {
 })
 ```
 
+> **`@testing-library/react` prerequisite**: add `"@testing-library/react": "^16.0.0"` to `apps/cli-app` devDependencies before running these tests. It is not in the Phase 5 `package.json` — Phase 5.6 adds it.
+
 **`apps/cli-app/src/hooks/__tests__/useAgent.test.ts`**
 
 ```typescript
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { renderHook, act } from '@testing-library/react'
 import { useAgent } from '../useAgent.js'
 import type { CliContext, CliSession } from '@agent/cli'
@@ -4565,9 +4567,8 @@ async function* makeExecuteGen(events: any[] = []) {
     return {} // RunResult
 }
 
-async function* makeThrowingGen() {
+async function* makeThrowingGen(): AsyncGenerator<never, any> {
     throw new Error('boom')
-    yield undefined as any
 }
 
 function makeAgent(events: any[] = [], throwOnExecute = false) {
@@ -4587,33 +4588,47 @@ function makeSession(overrides: Partial<CliSession> = {}): CliSession {
 }
 
 const context = {} as CliContext
-const baseOptions = {
-    onSessionUpdate: vi.fn(),
-    onError: vi.fn(),
-    sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any
+
+function makeOpts(overrides = {}) {
+    return {
+        onSessionUpdate: vi.fn(),
+        onPauseReason: vi.fn(),
+        onError: vi.fn(),
+        sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any,
+        ...overrides
+    }
 }
 
 describe('useAgent', () => {
     it('submitPrompt passes session.threadId to agent.execute', async () => {
         const agent = makeAgent()
         const session = makeSession()
-        const { result } = renderHook(() => useAgent(agent, context, true, session, baseOptions))
+        const opts = makeOpts()
+        const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
         act(() => { result.current.submitPrompt('hello', session) })
         await vi.waitFor(() =>
             expect(agent.execute).toHaveBeenCalledWith('hello', expect.objectContaining({ threadId: 'thread-sid' }))
         )
     })
 
+    it('submitPrompt is no-op when agent is null (missing apiKey)', () => {
+        const opts = makeOpts()
+        const { result } = renderHook(() => useAgent(null, context, true, makeSession(), opts))
+        act(() => { result.current.submitPrompt('hello', makeSession()) })
+        expect(opts.onError).not.toHaveBeenCalled()
+        // no uncaught promise rejection
+    })
+
     it('execute error becomes onError, not unhandled rejection', async () => {
         const agent = makeAgent([], true)
         const session = makeSession()
-        const opts = { ...baseOptions, onError: vi.fn() }
+        const opts = makeOpts()
         const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
         act(() => { result.current.submitPrompt('hello', session) })
         await vi.waitFor(() => expect(opts.onError).toHaveBeenCalledWith('boom'))
     })
 
-    it('approval.requested sets approval from event fields (not event.pauseReason)', async () => {
+    it('approval.requested calls onPauseReason with built PauseReason (from event fields)', async () => {
         const approvalEvent = {
             type: 'approval.requested',
             runId: 'run-1',
@@ -4625,30 +4640,23 @@ describe('useAgent', () => {
         }
         const agent = makeAgent([approvalEvent])
         const session = makeSession()
-        const opts = {
-            onSessionUpdate: vi.fn(),
-            onError: vi.fn(),
-            sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any
-        }
+        const opts = makeOpts()
         const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
         act(() => { result.current.submitPrompt('hello', session) })
-        await vi.waitFor(() => expect(result.current.approval).not.toBeNull())
-        expect(result.current.approval?.approvalId).toBe('ap1')
-        expect(result.current.approval?.toolName).toBe('shell_exec')
+        await vi.waitFor(() => expect(opts.onPauseReason).toHaveBeenCalled())
+        const pr = opts.onPauseReason.mock.calls[0][0]
+        expect(pr.approvalId).toBe('ap1')
+        expect(pr.toolName).toBe('shell_exec')
         expect(opts.onSessionUpdate).toHaveBeenCalledWith(
             expect.objectContaining({ status: 'paused', pendingRunId: 'run-1' })
         )
     })
 
-    it('run.completed clears pendingRunId and sets status completed', async () => {
+    it('run.completed calls onPauseReason(null) and clears pendingRunId', async () => {
         const completedEvent = { type: 'run.completed', runId: 'run-1' }
         const agent = makeAgent([completedEvent])
         const session = makeSession({ pendingRunId: 'run-1', status: 'paused' })
-        const opts = {
-            onSessionUpdate: vi.fn(),
-            onError: vi.fn(),
-            sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any
-        }
+        const opts = makeOpts()
         const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
         act(() => { result.current.submitPrompt('hello', session) })
         await vi.waitFor(() =>
@@ -4656,24 +4664,39 @@ describe('useAgent', () => {
                 expect.objectContaining({ status: 'completed', pendingRunId: undefined })
             )
         )
+        expect(opts.onPauseReason).toHaveBeenCalledWith(null)
     })
 
-    it('resolveApproval calls agent.resume with onEvent callback (not for-await)', async () => {
-        // First get approval state set via an approval event
+    it('updateSession patches immediately so sequential events use latest session', async () => {
+        // Two events: run.started then run.completed — completed should base on started's lastRunId
+        const events = [
+            { type: 'run.started', runId: 'run-1' },
+            { type: 'run.completed', runId: 'run-1' }
+        ]
+        const agent = makeAgent(events)
+        const session = makeSession()
+        const opts = makeOpts()
+        const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
+        act(() => { result.current.submitPrompt('hello', session) })
+        await vi.waitFor(() => expect(opts.onSessionUpdate).toHaveBeenCalledTimes(2))
+        const [startedUpdate, completedUpdate] = opts.onSessionUpdate.mock.calls
+        expect(startedUpdate[0].lastRunId).toBe('run-1')
+        // completed update must preserve lastRunId set by started update (not stale base)
+        expect(completedUpdate[0].lastRunId).toBe('run-1')
+        expect(completedUpdate[0].status).toBe('completed')
+    })
+
+    it('resolveApproval calls agent.resume with onEvent callback', async () => {
         const approvalEvent = {
             type: 'approval.requested', runId: 'run-1',
             approvalId: 'ap1', toolCallId: 'tc1', toolName: 'shell_exec', input: {}
         }
         const agent = makeAgent([approvalEvent])
         const session = makeSession({ pendingRunId: 'run-1' })
-        const opts = {
-            onSessionUpdate: vi.fn(),
-            onError: vi.fn(),
-            sessionStore: { save: vi.fn().mockResolvedValue(undefined) } as any
-        }
+        const opts = makeOpts()
         const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
         act(() => { result.current.submitPrompt('hello', session) })
-        await vi.waitFor(() => expect(result.current.approval).not.toBeNull())
+        await vi.waitFor(() => expect(opts.onPauseReason).toHaveBeenCalled())
         act(() => { result.current.resolveApproval('allow') })
         await vi.waitFor(() =>
             expect(agent.resume).toHaveBeenCalledWith(
@@ -4684,14 +4707,11 @@ describe('useAgent', () => {
         )
     })
 
-    it('resolveApproval shows error if pendingRunId missing', async () => {
-        const agent = makeAgent()
-        const session = makeSession({ pendingRunId: undefined })
-        const opts = { ...baseOptions, onError: vi.fn() }
-        const { result } = renderHook(() => useAgent(agent, context, true, session, opts))
-        // resolveApproval with no approval state — approval is null, so returns early without calling resume
+    it('resolveApproval errors when agent is null', () => {
+        const opts = makeOpts()
+        const { result } = renderHook(() => useAgent(null, context, true, makeSession(), opts))
         act(() => { result.current.resolveApproval('allow') })
-        expect(agent.resume).not.toHaveBeenCalled()
+        expect(opts.onError).toHaveBeenCalledWith(expect.stringContaining('API key'))
     })
 })
 ```
@@ -4700,60 +4720,67 @@ describe('useAgent', () => {
 
 **`@agent/cli` — session store**
 - [ ] `CliSession` / `CliSessionStatus` — exported from `@agent/cli`
-- [ ] `FsSessionStore.create/load/save/list/delete` — list sorted by `updatedAt` desc; file-safe IDs (UUID)
-- [ ] `FsSessionStore.loadByPrefix(prefix)` — returns `{ type: 'found'; session } | { type: 'ambiguous'; count } | { type: 'not-found' }`; ambiguous if prefix matches >1 session
+- [ ] `FsSessionStore.create/load/save/list/delete` — list sorted by `updatedAt` desc; file-safe IDs (UUID v4)
+- [ ] `FsSessionStore.loadByPrefix(prefix)` — returns discriminated union `{ type: 'found'; session } | { type: 'ambiguous'; count } | { type: 'not-found' }`; ambiguous when prefix matches >1 session
 - [ ] `createSessionId` / `createThreadId` / `getSessionTitle` — exported from `@agent/cli`
 - [ ] `getSessionTitle` — deterministic, no LLM call, ≤60 chars, collapses newlines, fallback "New session"
 
-**`apps/cli-app` — store and types**
-- [ ] `UiMessage` / `UiMessageKind` defined in `store/types.ts`, not in `app.tsx`; imported from `store/types.ts` by all consumers
-- [ ] Phase 5 Zustand store extended with `SessionSlice` + `MessagesSlice` — no `useState` for session/messages data
+**`apps/cli-app` — store**
+- [ ] `UiMessage` / `UiMessageKind` types defined **inside** `apps/cli-app/src/store.ts` (the Phase 5 file); exported from there
+- [ ] Phase 5 `useAgentStore` extended in-place in `store.ts`: adds `currentSession`, `sessions`, `uiMessages` fields + `setCurrentSession`, `setSessions`, `addUiMessage`, `clearUiMessages`, `setPauseReason` actions
+- [ ] No second Zustand store; `useAgentStore` is the single export
+- [ ] `ChatHistory` imports `UiMessage` from `'../store.js'`
 
 **`apps/cli-app` — command parser and registry**
 - [ ] `parseSlashCommand` — returns `ParsedCommand | null`; case-insensitive name; unknown → `{ name: 'unknown' }`
 - [ ] `CommandContext.apiKey` typed as `string | undefined`
 - [ ] `/config` — masks apiKey (shows `present` / `missing`, never the value)
 - [ ] `/stream on|off` — validates arg, shows error on bad input
-- [ ] `/resume <id>` — exact match via `load`, then prefix match via `loadByPrefix`; shows full session id; ambiguous prefix → error with count; missing → error
-- [ ] `/resume` with no id — lists recent sessions with full ids
+- [ ] `/resume <id>` — exact match via `load`, prefix match via `loadByPrefix`; full session id shown; ambiguous → error with count; not-found → error
+- [ ] `/resume` (no id) — lists recent sessions with full ids
 - [ ] `/new` — creates session + threadId, clears UI messages
-- [ ] `/cd` — resolves path, checks `fs.stat` (errors if missing or not a directory); after cwd change: `context` and `agent` useMemos recreate → next prompt uses new cwd and updated system prompt
-- [ ] `/model` no arg — shows current; with arg — sets model; agent useMemo recreates → next prompt uses new model
-- [ ] `/tools` — uses `Boolean(t.needsApproval)`
+- [ ] `/cd` — resolves path, checks `fs.stat` (errors if missing or not a directory); cwd change propagates to `context` and `agent` useMemos for next prompt
+- [ ] `/model` no arg — shows current; with arg — sets model; agent useMemo recreates for next prompt
+- [ ] `/tools` — uses `Boolean(t.needsApproval)` (not `t.requiresApproval`)
 
 **`apps/cli-app` — App**
-- [ ] `App` has no `agent` prop; agent created via `createCliAgent(config)` inside `React.useMemo`
-- [ ] Agent config: `engine` = `OpenAIEngine`, `system` = `getDefaultCliSystemPrompt(cwd)`, `memory` = `FsMemoryStore`, `checkpoints` = `FsCheckpointStore`, `tools`
-- [ ] Agent useMemo deps include `model`, `apiKey`, `baseURL`, `cwd`, `tools`, `memoryStore`, `checkpointStore`
-- [ ] `submitPrompt(input, session)` receives full `CliSession` — threadId extracted inside `useAgent`, no stale closure
-- [ ] `ensureSession` — creates session lazily on first prompt if none active
+- [ ] No `agent` prop; agent created via `React.useMemo` using `createCliAgent` + `createOpenAI({ apiKey, baseURL }).engine(model)`
+- [ ] Agent is `null` when `apiKey` is missing; startup shows error notice
+- [ ] Agent config: `system = getDefaultCliSystemPrompt(cwd)`, `memory = FsMemoryStore`, `checkpoints = FsCheckpointStore`, `tools`
+- [ ] Agent useMemo deps: `model`, `apiKey`, `baseURL`, `cwd`, `tools`, `memoryStore`, `checkpointStore`
+- [ ] State from `useAgentStore`: `pauseReason`, `currentSession`, `sessions`, `uiMessages`, `setPauseReason`, actions
+- [ ] `submitPrompt(input, session)` receives full `CliSession`
+- [ ] `ensureSession` — lazily creates session on first prompt
+- [ ] `<ApprovalModal onDecision={handleApproval} />` rendered when `pauseReason` is set in store (Phase 5 API)
 
 **`apps/cli-app` — useAgent**
-- [ ] `UseAgentOptions`: `onSessionUpdate`, `onError`, `sessionStore` only
-- [ ] `handleEvent` reads session/options via `sessionRef` / `optionsRef` — stable callback, no stale closure
+- [ ] Accepts `agent: IAgent<CliContext> | null`; `submitPrompt` and `resolveApproval` are no-ops (with `onError`) when agent is null
+- [ ] `UseAgentOptions`: `onSessionUpdate`, `onPauseReason`, `onError`, `sessionStore`
+- [ ] `updateSession(patch)` — reads `sessionRef.current`, patches, updates ref immediately, calls `onSessionUpdate`, saves via `sessionStore`
+- [ ] `handleEvent` is stable (created once); reads session/options via `sessionRef`/`optionsRef`/`approvalRef`
 - [ ] `submitPrompt(prompt, session)` — async IIFE, `for await (event of agent.execute(prompt, { context, threadId: session.threadId, stream }))`, errors → `onError`
-- [ ] `resolveApproval` — `await agent.resume(pendingRunId, { approvalId, decision }, { context, stream, onEvent: handleEvent })`; errors if `pendingRunId` missing or agent throws
-- [ ] `approval.requested` event: builds `PauseReason` from `event.approvalId/toolCallId/toolName/input/message` directly — not `event.pauseReason`
-- [ ] `run.completed` → clears `pendingRunId`, sets `status: completed`, saves session
-- [ ] `run.failed` / `run.cancelled` → updates session status, saves session
-- [ ] No access to agent private fields
+- [ ] `resolveApproval(decision)` — reads `approvalRef.current` for `approvalId`, calls `await agent.resume(pendingRunId, { approvalId, decision }, { context, stream, onEvent: handleEvent })`
+- [ ] `approval.requested`: PauseReason built from `event.approvalId/toolCallId/toolName/input/message`; `approvalRef` set; `onPauseReason(pauseReason)` called; `updateSession({ pendingRunId, status: 'paused' })`
+- [ ] `run.completed/failed/cancelled`: `approvalRef` cleared; `onPauseReason(null)` called; `updateSession(...)` with correct status
+- [ ] No access to agent private fields; returns `{ isRunning, agentEvents, submitPrompt, resolveApproval }`
 
 **`apps/cli-app` — UI**
 - [ ] `StatusBar` — model, cwd basename, session title/short-id, status, stream indicator, running state
-- [ ] `ChatHistory` — `user` / `assistant` / `notice` / `error` kinds with distinct colors; imports `UiMessage` from `store/types.ts`
+- [ ] `ChatHistory` — `user`/`assistant`/`notice`/`error` kinds with distinct colors; imports `UiMessage` from `'../store.js'`
 - [ ] `InputBox` — command mode hint when input starts with `/`
-- [ ] `ApprovalModal` — props unchanged from Phase 5 (`approval: PauseReason`, `onResolve: (decision) => void`)
+- [ ] `ApprovalModal` — **Phase 5 API kept**: `{ onDecision: (decision: 'allow' | 'deny') => void }`, reads `pauseReason` from `useAgentStore()`; no prop changes needed
 
 **Persistence**
-- [ ] Session metadata in `FsSessionStore`; messages in `FsMemoryStore` by `threadId` — no duplication
+- [ ] Session metadata in `FsSessionStore`; messages in `FsMemoryStore` by `threadId` — not duplicated in session JSON
 
-**Tests**
+**Tests & dependencies**
+- [ ] `"@testing-library/react": "^16.0.0"` added to `apps/cli-app` devDependencies
 - [ ] `FsSessionStore` — CRUD + list sort + limit + missing load + delete
 - [ ] `FsSessionStore.loadByPrefix` — found / ambiguous / not-found cases
 - [ ] `getSessionTitle` — empty, long, newlines
 - [ ] `parseSlashCommand` — known, unknown, case-insensitive, with/without args
 - [ ] Registry — `/new`, `/resume` (found/ambiguous/missing), `/clear`, `/config`, `/cd`, `/model`, `/stream`
-- [ ] `useAgent` — `submitPrompt` passes `session.threadId`; error → `onError`; approval fields (not `.pauseReason`); completed event; `resolveApproval` calls `agent.resume` with `onEvent`
+- [ ] `useAgent` tests: null agent no-op; `submitPrompt` passes `session.threadId`; error → `onError`; `approval.requested` calls `onPauseReason` with built PauseReason (not `event.pauseReason`); `updateSession` immediate ref update (sequential events test); `run.completed` calls `onPauseReason(null)`; `resolveApproval` calls `agent.resume` with `onEvent`
 
 **Verification**
 - `npx nx run @agent/cli:test --skip-nx-cache`
